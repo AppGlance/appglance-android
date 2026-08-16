@@ -159,13 +159,14 @@ internal class AndroidDeviceInfo(private val context: Context) : DeviceInfo {
     }
 
     /**
-     * Precedence: emulator, then debuggable build, then the configured channel (default
-     * production). An emulator run or a debuggable build is always reported as such, so a
-     * developer's own runs never reach the numbers by default.
+     * Precedence: debuggable build, then emulator, then the configured channel (default
+     * production) - the order the platform porting contract lists. A debuggable build or an
+     * emulator run is always reported as such, so a developer's own runs never reach the numbers
+     * by default.
      */
     override fun environment(override: AppEnvironment?): AppEnvironment = when {
-        isEmulator() -> AppEnvironment.EMULATOR
         isDebuggable() -> AppEnvironment.DEBUG
+        isEmulator() -> AppEnvironment.EMULATOR
         else -> override ?: AppEnvironment.PRODUCTION
     }
 

@@ -179,7 +179,7 @@ class AndroidPlatformTest {
     }
 
     @Test
-    fun `environment precedence is emulator, then debuggable, then the configured channel`() {
+    fun `environment precedence is debuggable, then emulator, then the configured channel`() {
         // A real device by every tell, not debuggable: production unless told otherwise.
         ShadowBuild.setFingerprint("google/oriole/oriole:14/AP1A.240305.019.A1/11445699:user/release-keys")
         ShadowBuild.setModel("Pixel 6")
@@ -199,10 +199,16 @@ class AndroidPlatformTest {
         assertEquals(AppEnvironment.DEBUG, device.environment(null))
         assertEquals(AppEnvironment.DEBUG, device.environment(AppEnvironment.BETA))
 
-        // Emulator beats even that.
+        // An emulator run of a release build: emulator, whatever the channel says.
         ShadowBuild.setFingerprint("google/sdk_gphone64_arm64/emu64a:14/UE1A.230829.036/11228894:userdebug/dev-keys")
         ShadowBuild.setHardware("ranchu")
+        info.flags = info.flags and ApplicationInfo.FLAG_DEBUGGABLE.inv()
         assertEquals(AppEnvironment.EMULATOR, device.environment(AppEnvironment.PRODUCTION))
+
+        // A debuggable build on that emulator: debuggable is checked first - the porting
+        // contract's order. Both are kept out of the numbers by default either way.
+        info.flags = info.flags or ApplicationInfo.FLAG_DEBUGGABLE
+        assertEquals(AppEnvironment.DEBUG, device.environment(AppEnvironment.PRODUCTION))
     }
 
     @Test
