@@ -21,8 +21,10 @@ internal data class Event(
      */
     val eventId: String,
     /**
-     * The session this event belongs to (minted at each `session.start`); null for events
-     * recorded before an install's first session, such as `install` itself.
+     * The session this event belongs to. `session.start` mints it - or adopts the id pre-minted
+     * at client init, so `install` and everything else recorded before the first foreground carry
+     * the same id the coming `session.start` does. Optional on the wire, but in practice always
+     * present on what this SDK records.
      */
     val sessionId: String?,
     val appId: String,

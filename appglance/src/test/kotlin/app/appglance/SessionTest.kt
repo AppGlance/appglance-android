@@ -3,9 +3,11 @@ package app.appglance
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.time.Duration
@@ -27,7 +29,16 @@ class SessionTest {
         val config = testConfiguration(sessionTimeout = sessionTimeout)
 
         /** A new process against the same device state. */
-        fun launch(): Client = makeClient(platform, clock, scheduler, transport, config)
+        fun launch(executor: Executor = directExecutor, isNewInstall: Boolean = false): Client = makeClient(
+            platform,
+            clock,
+            scheduler,
+            transport,
+            config,
+            isNewInstall = isNewInstall,
+            installAt = if (isNewInstall) clock.now else null,
+            executor = executor,
+        )
 
         /** The signals persisted for the app id - what a relaunch would load. */
         fun onDisk(): List<String> {
@@ -457,5 +468,129 @@ class SessionTest {
             "and it lands once connectivity comes back",
             rig.transport.signals().contains(Signal.HEARTBEAT),
         )
+    }
+
+    // The session id is pre-minted at init whenever the next foreground will start a new session
+    // (a fresh install, or a cold start past the timeout). `install` and every event recorded
+    // before the first foreground already carry the id `session.start` then adopts, so the server
+    // sees one session per launch - never a second, id-less one for the early events.
+
+    @Test
+    fun `install and pre-foreground events carry the id session start adopts`() {
+        val rig = Rig()
+        val client = rig.launch(isNewInstall = true)
+        client.recordInstallIfNeeded()
+        client.track("early", null)                  // tracked from Application.onCreate, say
+        client.setActive(true)
+        rig.scheduler.settle()
+        client.flush()
+
+        val events = rig.transport.batches().flatten()
+        assertEquals(
+            listOf(Signal.INSTALL, "early", Signal.SESSION_START, Signal.HEARTBEAT),
+            events.map { it.signal },
+        )
+        val ids = events.map { it.sessionId }.toSet()
+        assertEquals("one launch, one session id, install included", 1, ids.size)
+        assertNotNull("and it is a real id, not null", ids.single())
+    }
+
+    @Test
+    fun `the pre-minted id is adopted exactly once`() {
+        val rig = Rig()
+        val client = rig.launch()
+        val preminted = client.currentSessionId()
+        assertNotNull("minted at init, before any foreground", preminted)
+
+        client.setActive(true)                       // session.start adopts it
+        rig.scheduler.settle()
+        assertEquals(preminted, client.currentSessionId())
+
+        client.setActive(false)
+        rig.clock.advance(30.seconds)
+        client.setActive(true)                       // within the timeout: a resume, same id
+        rig.scheduler.settle()
+        assertEquals(preminted, client.currentSessionId())
+
+        client.setActive(false)
+        rig.clock.advance(6.minutes)
+        client.setActive(true)                       // past the timeout: a fresh id, never the pre-minted one again
+        rig.scheduler.settle()
+        assertNotEquals(preminted, client.currentSessionId())
+        client.flush()
+        assertEquals(2, rig.transport.signals().count { it == Signal.SESSION_START })
+    }
+
+    @Test
+    fun `a process that dies before the first foreground does not strand the pre-minted id`() {
+        val rig = Rig()
+        val first = rig.launch(isNewInstall = true)
+        first.recordInstallIfNeeded()
+        val preminted = first.currentSessionId()
+        // The process is killed here: the app never reached the foreground, nothing was sent.
+
+        rig.clock.advance(10.minutes)
+        val second = rig.launch()
+        assertEquals("the unadopted id is found and reused, not replaced", preminted, second.currentSessionId())
+        second.setActive(true)
+        rig.scheduler.settle()
+        second.flush()
+
+        val events = rig.transport.batches().flatten()
+        assertEquals(
+            "the install queued by the dead process still opens the batch",
+            listOf(Signal.INSTALL, Signal.SESSION_START, Signal.HEARTBEAT),
+            events.map { it.signal },
+        )
+        assertEquals("and every event shares the one id", setOf(preminted), events.map { it.sessionId }.toSet())
+    }
+
+    @Test
+    fun `a cold start past the timeout pre-mints the new session id for early events`() {
+        val rig = Rig()
+        val first = rig.launch()
+        first.setActive(true)
+        rig.scheduler.settle()
+        val firstSession = first.currentSessionId()
+        first.setActive(false)
+        first.flush()
+
+        rig.clock.advance(10.minutes)                // relaunched well past the 5-minute timeout
+        val second = rig.launch()
+        val preminted = second.currentSessionId()
+        assertNotEquals("the coming session's id, not the dead session's", firstSession, preminted)
+        second.track("from.push", null)              // recorded before any foreground
+        second.setActive(true)
+        rig.scheduler.settle()
+        second.flush()
+
+        val late = rig.transport.batches().last()
+        assertEquals(listOf("from.push", Signal.SESSION_START, Signal.HEARTBEAT), late.map { it.signal })
+        assertEquals(setOf(preminted), late.map { it.sessionId }.toSet())
+    }
+
+    @Test
+    fun `a relaunch inside the timeout pre-mints nothing and resumes untouched`() {
+        val rig = Rig()
+        val first = rig.launch()
+        first.setActive(true)
+        rig.scheduler.settle()
+        val sid = first.currentSessionId()
+        first.setActive(false)
+        first.flush()
+
+        rig.clock.advance(60.seconds)
+        val second = rig.launch()
+        assertEquals("still inside the session: its id, nothing new", sid, second.currentSessionId())
+        second.track("early", null)                  // before the foreground report: still that session's
+        second.setActive(true)
+        rig.scheduler.settle()
+        assertEquals(0, second.pendingSignals().count { it == Signal.SESSION_START })
+        assertNull(
+            "no pre-minted id was persisted for a session that never needed one",
+            rig.platform.prefs.getString("session.pending." + rig.config.appId),
+        )
+        second.flush()
+        assertEquals(setOf(sid), rig.transport.batches().flatten().map { it.sessionId }.toSet())
     }
 }

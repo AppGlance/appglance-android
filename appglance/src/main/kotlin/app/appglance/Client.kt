@@ -57,13 +57,19 @@ internal class Client(
     // Session state. A session is "the app is in front of the user"; it survives short
     // interruptions and ends only after `sessionTimeout` of absence - the same gap the dashboard
     // uses, so the two agree on what a session is. Persisted so a kill-and-relaunch inside the
-    // timeout continues the session and a relaunch after it starts a new one.
+    // timeout continues the session and a relaunch after it starts a new one. When init can
+    // already tell that the next foreground will start a NEW session, its id is pre-minted right
+    // there (see [premintSessionIdIfNeeded]), so `install` and everything else recorded before
+    // the first foreground carry the id `session.start` will carry.
     private var isActive = false
     private var lastActiveAt: Long? = null
     private var lastHeartbeatAt: Long? = null
     private var sessionId: String? = null
+    /** True while [sessionId] is pre-minted for the coming session and no `session.start` has adopted it yet. */
+    private var sessionIdPreminted = false
     private val lastActiveKey = "lastActive.$appId"
     private val sessionKey = "session.$appId"
+    private val pendingSessionKey = "session.pending.$appId"
 
     // User properties. The last snapshot the server has is mirrored here, so `identify` with the
     // same values on every launch sends nothing; only a change costs an event.
@@ -77,6 +83,7 @@ internal class Client(
             lastActiveAt = it
             sessionId = prefs.getString(sessionKey)
         }
+        premintSessionIdIfNeeded()
         traits = prefs.getString(traitsKey)?.let(::decodeTraits) ?: emptyMap()
         queueStore.load()?.let { queue.addAll(EventCoding.decode(it)) }
         announce()
@@ -240,9 +247,15 @@ internal class Client(
         val t = at ?: now()
         if (active) {
             val last = lastActiveAt
-            val resumes = last != null && sessionId != null && t - last <= config.sessionTimeout.inWholeMilliseconds
+            val resumes = last != null && sessionId != null && !sessionIdPreminted &&
+                t - last <= config.sessionTimeout.inWholeMilliseconds
             if (!resumes) {
-                sessionId = UUID.randomUUID().toString()
+                // A pre-minted id (already on every event recorded since init) becomes the
+                // session's id, exactly once; without one this is an in-process new session (the
+                // app backgrounded past the timeout and came back) and the id is minted here.
+                if (!sessionIdPreminted) sessionId = UUID.randomUUID().toString()
+                sessionIdPreminted = false
+                prefs.remove(pendingSessionKey)
                 track(Signal.SESSION_START, null, t)
             }
             rememberActive(t)
@@ -268,6 +281,31 @@ internal class Client(
     // endregion
 
     // region Sessions and the heartbeat
+
+    /**
+     * Gives the coming session its id at init time, whenever init can already tell that the next
+     * foreground will start a new session: there is no resumable session (a fresh install), or
+     * the gap since the last activity is past `sessionTimeout`. `install` and everything else
+     * recorded before the first foreground then carry the same id `session.start` adopts, so the
+     * server sees one session per launch instead of minting a second row for id-less early events.
+     *
+     * The id is persisted under its own key the moment it is minted and stays there until a
+     * `session.start` adopts it. A process that dies before ever reaching the foreground therefore
+     * does not strand it: the next launch finds the unadopted id and reuses it instead of minting
+     * another, and the events already queued under it keep their session. [setActive] adopts it
+     * exactly once, re-checking the gap against its own clock; the within-timeout resume path
+     * never involves it, because a live session's recent stamp means nothing was pre-minted.
+     */
+    private fun premintSessionIdIfNeeded() {
+        if (!collecting) return   // a gated client records nothing and must not write state
+        val last = lastActiveAt
+        val resumes = last != null && sessionId != null && now() - last <= config.sessionTimeout.inWholeMilliseconds
+        if (resumes) return
+        sessionId = prefs.getString(pendingSessionKey) ?: UUID.randomUUID().toString().also {
+            prefs.putString(pendingSessionKey, it)
+        }
+        sessionIdPreminted = true
+    }
 
     /**
      * The moment we last knew the app was in front of the user; the session timeout counts from
@@ -468,7 +506,10 @@ internal class Client(
     /** The user properties as the SDK believes the server has them. */
     fun currentTraits(): Map<String, String> = traits
 
-    /** The current session id (null until the first `session.start`). */
+    /**
+     * The session id every recorded event is stamped with: pre-minted at init when a new session
+     * is coming, the resumed one otherwise. Null only for a gated client that never had one.
+     */
     fun currentSessionId(): String? = sessionId
 
     // endregion
