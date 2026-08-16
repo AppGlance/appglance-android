@@ -151,6 +151,31 @@ class AndroidPlatformTest {
                 hardware = "s5e8835",
             ),
         )
+        // Real hardware on a custom ROM often reports a bare "unknown" fingerprint. That alone is
+        // not an emulator tell; only another marker alongside it is.
+        assertFalse(
+            AndroidDeviceInfo.isEmulator(
+                fingerprint = "unknown",
+                model = "POCO F1",
+                manufacturer = "Xiaomi",
+                brand = "xiaomi",
+                device = "beryllium",
+                product = "lineage_beryllium",
+                hardware = "qcom",
+            ),
+        )
+        assertTrue(
+            "an unknown fingerprint plus emulator hardware is still an emulator",
+            AndroidDeviceInfo.isEmulator(
+                fingerprint = "unknown",
+                model = "x",
+                manufacturer = "x",
+                brand = "x",
+                device = "x",
+                product = "x",
+                hardware = "ranchu",
+            ),
+        )
     }
 
     @Test

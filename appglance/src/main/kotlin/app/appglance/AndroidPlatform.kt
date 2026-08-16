@@ -174,9 +174,11 @@ internal class AndroidDeviceInfo(private val context: Context) : DeviceInfo {
     companion object {
         /**
          * The usual fingerprint and hardware tells for the Android Emulator (goldfish/ranchu, the
-         * `sdk_gphone*` products, Cuttlefish) and Genymotion. Best-effort: a false negative means
-         * an emulator run is tagged debug (still gated by default) or, for a device lying about
-         * itself, production.
+         * `sdk_gphone*` products, Cuttlefish) and Genymotion. A fingerprint of just "unknown" is
+         * NOT a tell on its own: some OEM and custom-ROM builds ship it on real hardware, and the
+         * hardware and product checks below still catch any emulator that reports it. Best-effort:
+         * a false negative means an emulator run is tagged debug (still gated by default) or, for
+         * a device lying about itself, production.
          */
         fun isEmulator(
             fingerprint: String = Build.FINGERPRINT ?: "",
@@ -187,7 +189,6 @@ internal class AndroidDeviceInfo(private val context: Context) : DeviceInfo {
             product: String = Build.PRODUCT ?: "",
             hardware: String = Build.HARDWARE ?: "",
         ): Boolean = fingerprint.startsWith("generic") ||
-            fingerprint.startsWith("unknown") ||
             fingerprint.contains("emulator", ignoreCase = true) ||
             fingerprint.contains("sdk_gphone") ||
             model.contains("google_sdk") ||
