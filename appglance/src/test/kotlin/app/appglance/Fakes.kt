@@ -88,6 +88,11 @@ internal class RecordingTransport : Transport {
     /** When set, no connection is ever established. */
     @Volatile var offline = false
 
+    /** When set, reported as the numeric Retry-After (seconds) of every response. */
+    @Volatile var retryAfterSeconds: Long? = null
+
+    override fun lastRetryAfterSeconds(): Long? = retryAfterSeconds
+
     fun script(vararg s: Int) = synchronized(lock) {
         statuses.clear()
         statuses.addAll(s.toList())
@@ -223,7 +228,10 @@ internal fun testConfiguration(
     debug = debug,
 )
 
-/** A client wired to the fakes; `userId` is fixed so tests can reason about it. */
+/**
+ * A client wired to the fakes; `userId` is fixed so tests can reason about it, and the backoff
+ * jitter is pinned to the bottom of its window so waits are exact numbers.
+ */
 internal fun makeClient(
     platform: InMemoryPlatform,
     clock: FakeClock,
@@ -234,6 +242,7 @@ internal fun makeClient(
     isNewInstall: Boolean = false,
     installAt: Long? = null,
     executor: Executor = directExecutor,
+    random: () -> Double = { 0.0 },
 ) = Client(
     config = config,
     userId = userId,
@@ -244,4 +253,5 @@ internal fun makeClient(
     sendExecutor = executor,
     transport = transport,
     now = { clock.now },
+    random = random,
 )

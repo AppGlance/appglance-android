@@ -20,6 +20,8 @@ class HttpTransportTest {
 
     @Volatile private var respondWith = 202
 
+    @Volatile private var respondWithRetryAfter: String? = null
+
     @Before
     fun start() {
         server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
@@ -27,6 +29,7 @@ class HttpTransportTest {
             val body = exchange.requestBody.readBytes().toString(Charsets.UTF_8)
             val headers = exchange.requestHeaders.entries.associate { (k, v) -> k.lowercase() to v.joinToString(",") }
             received += Received(exchange.requestMethod, headers, body)
+            respondWithRetryAfter?.let { exchange.responseHeaders.set("Retry-After", it) }
             val reply = "{\"accepted\":1,\"rejected\":0}".toByteArray()
             exchange.sendResponseHeaders(respondWith, reply.size.toLong())
             exchange.responseBody.use { it.write(reply) }
@@ -80,6 +83,26 @@ class HttpTransportTest {
         respondWith = 500
         assertEquals(500, transport.send("[]".toByteArray()))
         assertEquals(4, received.size)
+    }
+
+    @Test
+    fun `a numeric Retry-After is surfaced and anything else is ignored`() {
+        val transport = HttpTransport(endpoint, "k")
+        respondWith = 429
+        respondWithRetryAfter = "30"
+        assertEquals(429, transport.send("[]".toByteArray()))
+        assertEquals(30L, transport.lastRetryAfterSeconds())
+
+        // The HTTP-date form is legal but not worth a parser; the client just backs off normally.
+        respondWithRetryAfter = "Wed, 21 Oct 2026 07:28:00 GMT"
+        transport.send("[]".toByteArray())
+        assertEquals(null, transport.lastRetryAfterSeconds())
+
+        // And a response without the header leaves nothing stale behind.
+        respondWithRetryAfter = null
+        respondWith = 202
+        transport.send("[]".toByteArray())
+        assertEquals(null, transport.lastRetryAfterSeconds())
     }
 
     @Test

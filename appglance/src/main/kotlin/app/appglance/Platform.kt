@@ -80,6 +80,14 @@ internal interface Scheduler {
 internal interface Transport {
     fun send(body: ByteArray): Int
 
+    /**
+     * The `Retry-After` of the most recent response, in whole seconds, when the server sent a
+     * numeric one; null otherwise (absent header, HTTP-date form, or no response at all). The
+     * client reads it right after a 429 from [send]; sends are serial, so "most recent" is
+     * unambiguous.
+     */
+    fun lastRetryAfterSeconds(): Long? = null
+
     companion object {
         /**
          * The request failed after a connection existed - a timeout, or a connection dropped

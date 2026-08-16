@@ -14,7 +14,14 @@ internal class HttpTransport(
     private val timeoutMillis: Int = 15_000,
 ) : Transport {
 
+    /** See [Transport.lastRetryAfterSeconds]; refreshed on every response, cleared when absent. */
+    @Volatile
+    private var retryAfterSeconds: Long? = null
+
+    override fun lastRetryAfterSeconds(): Long? = retryAfterSeconds
+
     override fun send(body: ByteArray): Int {
+        retryAfterSeconds = null
         val connection = try {
             URL(endpoint).openConnection() as HttpURLConnection
         } catch (_: Exception) {
@@ -42,6 +49,8 @@ internal class HttpTransport(
             }
             connection.outputStream.use { it.write(body) }
             val status = connection.responseCode
+            // Only the numeric form; an HTTP-date here is vanishingly rare and not worth a parser.
+            retryAfterSeconds = connection.getHeaderField("Retry-After")?.trim()?.toLongOrNull()?.takeIf { it >= 0 }
             // Read and discard the body so the connection can be reused.
             try {
                 (if (status >= 400) connection.errorStream else connection.inputStream)?.use { stream ->

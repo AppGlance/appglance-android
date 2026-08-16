@@ -27,6 +27,8 @@ internal class Client(
     private val sendExecutor: Executor,
     private val transport: Transport,
     private val now: () -> Long = System::currentTimeMillis,
+    /** Uniform in `[0, 1)`; seam for the backoff jitter, so tests can pin it. */
+    private val random: () -> Double = Math::random,
 ) {
     private val device = platform.device
     private val prefs = platform.prefs
@@ -53,6 +55,11 @@ internal class Client(
     private var flushTask: Runnable? = null
     private var heartbeatTask: Runnable? = null
     private val drainPending = AtomicBoolean(false)
+
+    // Automatic-retry backoff. Written by the send loop, read by the triggers on the command
+    // thread, hence under [queueLock]. See [backOff].
+    private var failureStreak = 0
+    private var nextAttemptAt = 0L
 
     // Session state. A session is "the app is in front of the user"; it survives short
     // interruptions and ends only after `sessionTimeout` of absence - the same gap the dashboard
@@ -189,7 +196,7 @@ internal class Client(
             "▸ $signal" + (if (signal == Signal.HEARTBEAT) " (presence ping)" else "") +
                 (metadata?.let { " $it" } ?: "")
         }
-        if (size >= config.maxBatchSize) flush() else scheduleFlush()
+        if (size >= config.maxBatchSize) flushSoon() else scheduleFlush()
     }
 
     /**
@@ -355,17 +362,29 @@ internal class Client(
 
     // region Delivery
 
-    private fun scheduleFlush() {
+    /**
+     * An automatic send trigger (the batch filling up, the flush timer firing): drains now unless
+     * a retry backoff is in force, in which case the attempt is deferred to when the window closes
+     * rather than dropped. [flush] is the unthrottled path for the developer's own call and for
+     * the flush on backgrounding - the first is "send now" said explicitly, the second is the last
+     * chance before the process may die, already paced by the user's own comings and goings.
+     */
+    private fun flushSoon() {
+        val holdMillis = synchronized(queueLock) { nextAttemptAt - now() }
+        if (holdMillis <= 0) flush() else scheduleFlush(holdMillis)
+    }
+
+    private fun scheduleFlush(delayMillis: Long = config.flushInterval.inWholeMilliseconds) {
         if (flushTask != null) return
         val task = object : Runnable {
             override fun run() {
                 if (flushTask !== this) return   // an explicit flush cancelled this timer
                 flushTask = null
-                flush()
+                flushSoon()                      // re-checks the backoff; defers again if still inside it
             }
         }
         flushTask = task
-        scheduler.postDelayed(task, config.flushInterval.inWholeMilliseconds)
+        scheduler.postDelayed(task, delayMillis)
     }
 
     /**
@@ -401,6 +420,8 @@ internal class Client(
                 status in 200..299 -> {
                     synchronized(queueLock) {
                         inFlightBatch = emptyList()
+                        failureStreak = 0
+                        nextAttemptAt = 0L
                         persistLocked()
                     }
                     log { "✓ sent $count" }
@@ -434,9 +455,25 @@ internal class Client(
                     val why = if (status < 0) "no response" else "HTTP $status"
                     log { "⟳ couldn't send ($why) - keeping $count for the next try" }
                     requeue(batch, keepingHeartbeats = status == Transport.NEVER_CONNECTED)
+                    backOff(retryAfterSeconds = if (status == 429) transport.lastRetryAfterSeconds() else null)
                     return
                 }
             }
+        }
+    }
+
+    /**
+     * Arms the automatic-retry throttle after a retryable failure. The next automatic drain waits
+     * `min(60 s, 2^failures seconds)`, jittered into the upper half of that window so clients that
+     * failed together do not all retry together, and never less than the server's own numeric
+     * `Retry-After` on a 429. A successful send clears it; [flush] ignores it (see [flushSoon]).
+     */
+    private fun backOff(retryAfterSeconds: Long?) {
+        synchronized(queueLock) {
+            failureStreak++
+            val base = minOf(MAX_BACKOFF_MILLIS, (1L shl minOf(failureStreak, 6)) * 1_000L)
+            val jittered = base / 2 + (random() * (base / 2)).toLong()
+            nextAttemptAt = now() + maxOf(jittered, (retryAfterSeconds ?: 0L) * 1_000L)
         }
     }
 
@@ -517,6 +554,9 @@ internal class Client(
     companion object {
         /** Hard cap on the queue, so repeated failures cannot grow it without bound. */
         const val MAX_QUEUED_EVENTS: Int = 500
+
+        /** Ceiling on the automatic-retry backoff window. */
+        const val MAX_BACKOFF_MILLIS: Long = 60_000L
 
         /**
          * Events per request. The ingest API accepts up to 500 events / 256 KB per batch; a
