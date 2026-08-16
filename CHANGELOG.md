@@ -8,6 +8,40 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-17
+
+### Fixed
+
+- The `install` event, and anything else tracked before the app first reaches the foreground, now
+  carries the same `session_id` the first `session.start` carries. The coming session's id is
+  minted at configure whenever the next foreground will start a new session, and persisted until
+  a `session.start` adopts it, so even a launch that never reaches the foreground hands it to the
+  next one. It used to be minted only at the first foreground, which left those early events
+  without a session and made the server create a second session row on every first launch.
+- Calling `configure` again while the app is in the foreground (the documented way to apply a
+  consent change) resumes the session immediately. The replacement client used to stay inactive
+  until the app was backgrounded and reopened.
+- A device whose build fingerprint is just `unknown` (some OEM and custom ROM builds) is no
+  longer classified as an emulator on that alone. The hardware and product checks still catch
+  real emulators that report it.
+
+### Added
+
+- Configuration validation at construction: `heartbeatInterval` at least 15 seconds,
+  `maxBatchSize` between 1 and 500, `flushInterval` and `sessionTimeout` positive. A zero
+  interval was a tight send loop; failing fast with a clear message beats misbehaving quietly.
+- Exponential backoff between automatic delivery retries after a transient failure, jittered and
+  capped at 60 seconds, honoring a numeric `Retry-After` on 429 as the floor. A queue past
+  `maxBatchSize` used to retry on every new event with no throttle. An explicit `flush()` still
+  sends immediately, and the first successful send resets the backoff.
+
+### Changed
+
+- Environment detection checks the debuggable flag before the emulator heuristics, the order the
+  platform contract lists. A debuggable build on an emulator is now tagged `debug` rather than
+  `emulator`; both are kept out of your numbers by default, so nothing changes unless you send
+  from one with `debug = true`.
+
 ## [1.0.0] - 2026-08-16
 
 First public release, feature-equivalent with the Swift SDK 1.0.0 and sharing its wire format.

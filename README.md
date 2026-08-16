@@ -13,7 +13,7 @@ id, and one call of setup. Sessions and presence are handled for you. The Swift 
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation("app.appglance:appglance:1.0.0")
+    implementation("app.appglance:appglance:1.0.1")
 }
 ```
 
@@ -111,9 +111,9 @@ AppGlance.configure(this, AppGlance.Configuration(
 
 | Option | Default | Notes |
 |---|---|---|
-| `flushInterval` | `10.seconds` | Wait before sending a partial batch. |
-| `maxBatchSize` | `20` | Send at once when this many events are queued. |
-| `heartbeatInterval` | `60.seconds` | Presence-ping cadence while foregrounded (drives "active now"). Never billable. |
+| `flushInterval` | `10.seconds` | Wait before sending a partial batch. Must be positive. |
+| `maxBatchSize` | `20` | Send at once when this many events are queued. 1 to 500. |
+| `heartbeatInterval` | `60.seconds` | Presence-ping cadence while foregrounded (drives "active now"). Never billable. At least 15 s. |
 | `sessionTimeout` | `5.minutes` | Away longer than this and coming back is a new session - the dashboard splits on the same gap. |
 | `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. |
 | `collectsCountry` | `true` | The device's region *setting* (system locale) as a two-letter code. Not GPS, not IP. |
@@ -137,7 +137,8 @@ dashboard exactly like an App Store build.
   reinstall on the same account usually keeps it. `install` is recorded exactly once, first.
 - Events are persisted to `noBackupFilesDir` as they are tracked, so a crash loses nothing. The
   queue is capped at 500 (oldest dropped), sent oldest-first in slices of 100, one send at a
-  time. `429`, `5xx` and offline keep the batch for later; `413` halves it; any other `4xx` (a
+  time. `429`, `5xx` and offline keep the batch for later, with exponential backoff between
+  automatic retries (a numeric `Retry-After` is honored); `413` halves it; any other `4xx` (a
   wrong key, say) drops that slice rather than wedging the queue.
 - Retries never double-count. Every event carries a client-minted id and the ingest ignores
   replays; the presence ping - which is folded into rollups on arrival - is re-sent only when the
