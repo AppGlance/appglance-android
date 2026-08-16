@@ -1,0 +1,11 @@
+# Gradle / Android build state, all of it regenerable. gradle/wrapper/gradle-wrapper.jar is
+# committed on purpose: a fresh clone runs ./gradlew and gets the pinned Gradle.
+.gradle/
+build/
+*/build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+captures/
+.DS_Store

@@ -1,0 +1,25 @@
+[versions]
+# AGP 9 has Kotlin built in; applying org.jetbrains.kotlin.android as well is an error.
+agp = "9.3.1"
+# lifecycle-process provides ProcessLifecycleOwner. Deliberately not the newest line: whatever a
+# library depends on becomes a floor for every app that adds it, and 2.8.x needs only compileSdk 34.
+# An app on a newer lifecycle simply wins the resolution.
+lifecycle = "2.8.7"
+junit = "4.13.2"
+# The real org.json for JVM unit tests: android.jar's stub throws "not mocked" from every method.
+json = "20240303"
+# Runs the Android glue (SharedPreferences, files, ProcessLifecycleOwner) on the JVM.
+robolectric = "4.16"
+# Publishing to Maven Central: the javadoc jar and GPG signatures Central requires, uploaded
+# through the Central Portal.
+mavenPublish = "0.33.0"
+
+[libraries]
+androidx-lifecycle-process = { group = "androidx.lifecycle", name = "lifecycle-process", version.ref = "lifecycle" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+json = { group = "org.json", name = "json", version.ref = "json" }
+robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
+
+[plugins]
+android-library = { id = "com.android.library", version.ref = "agp" }
+maven-publish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }
