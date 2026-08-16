@@ -3,6 +3,7 @@ package app.appglance
 import android.os.Handler
 import android.os.Looper
 import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 
@@ -21,7 +22,14 @@ internal object LifecycleBridge : DefaultLifecycleObserver {
 
     // Main thread only. `addObserver` is itself idempotent for the same observer.
     private fun attach() {
-        ProcessLifecycleOwner.get().lifecycle.addObserver(this)
+        val lifecycle = ProcessLifecycleOwner.get().lifecycle
+        lifecycle.addObserver(this)
+        // `configure` while the app is already in front: `addObserver` replays the lifecycle only
+        // to a NEW observer, and this one has been attached since the first configure - so a
+        // client created by a later configure (the documented way to apply a consent change)
+        // would sit inactive until the app was backgrounded and reopened. Hand it the start it
+        // missed; `setActive` is idempotent, so the paths that did get the replay are unaffected.
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) AppGlance.setActive(true)
     }
 
     override fun onStart(owner: LifecycleOwner) {
