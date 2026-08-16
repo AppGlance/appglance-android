@@ -72,19 +72,19 @@ public object AppGlance {
         public val endpoint: String = DEFAULT_ENDPOINT,
         /** Marketing version of the app; defaults to the package's `versionName`. */
         public val appVersion: String? = null,
-        /** How long to wait before sending a partial batch. Default 10 s. */
+        /** How long to wait before sending a partial batch. Must be positive. Default 10 s. */
         public val flushInterval: Duration = 10.seconds,
-        /** Send at once when this many events are queued. Default 20. */
+        /** Send at once when this many events are queued. 1 to 500, the ingest API's per-request maximum. Default 20. */
         public val maxBatchSize: Int = 20,
         /**
          * Time between presence pings while the app is in the foreground. They power "active right
-         * now" and session length, and are never billable. Default 60 s.
+         * now" and session length, and are never billable. At least 15 seconds. Default 60 s.
          */
         public val heartbeatInterval: Duration = 60.seconds,
         /**
          * How long the app can be away - backgrounded, or killed and relaunched - before coming back
-         * starts a new session (`session.start`). Default 5 minutes, the same gap the dashboard uses
-         * to split an install's events into sessions.
+         * starts a new session (`session.start`). Must be positive. Default 5 minutes, the same gap
+         * the dashboard uses to split an install's events into sessions.
          */
         public val sessionTimeout: Duration = 5.minutes,
         /** Master switch. `false` records and sends nothing (e.g. behind a user setting). Default true. */
@@ -126,6 +126,22 @@ public object AppGlance {
          */
         public val debug: Boolean = false,
     ) {
+        // Values in these ranges could only be mistakes - a zero heartbeat is a tight send loop, a
+        // zero batch size could never send - so they fail here, loudly, where the stack trace
+        // points at the call that passed them, instead of misbehaving quietly in the field.
+        init {
+            require(flushInterval.isPositive()) { "flushInterval must be positive, got $flushInterval" }
+            require(heartbeatInterval >= 15.seconds) {
+                "heartbeatInterval must be at least 15 seconds, got $heartbeatInterval: presence needs no finer " +
+                    "resolution, and anything shorter only spends the user's battery and data"
+            }
+            require(sessionTimeout.isPositive()) { "sessionTimeout must be positive, got $sessionTimeout" }
+            require(maxBatchSize in 1..500) {
+                "maxBatchSize must be between 1 and 500, got $maxBatchSize: the ingest API accepts at most " +
+                    "500 events per request"
+            }
+        }
+
         public companion object {
             /** The hosted ingest endpoint. */
             public const val DEFAULT_ENDPOINT: String = "https://api.appglance.app/v1/events"

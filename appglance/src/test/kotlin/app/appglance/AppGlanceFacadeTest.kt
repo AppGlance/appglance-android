@@ -32,7 +32,7 @@ class AppGlanceFacadeTest {
         apiKey = "glance_live_test",
         endpoint = "https://ingest.invalid/v1/events",
         flushInterval = 1.hours,
-        maxBatchSize = 1000,
+        maxBatchSize = 500,
         enabledEnvironments = AppEnvironment.values().toSet(),
         trackAppLifecycle = false,     // driven by hand below; ProcessLifecycleOwner is exercised separately
         debug = debug,

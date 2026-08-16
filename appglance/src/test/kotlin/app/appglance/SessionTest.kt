@@ -264,7 +264,9 @@ class SessionTest {
     @Test
     fun `a persisted queue is picked up by the next launch and the cap drops the oldest`() {
         val rig = Rig()
-        val first = rig.launch()
+        // The first process is killed before its sender ever gets to run: the full-batch flush it
+        // requests at 500 queued goes nowhere, and everything stays owed on disk.
+        val first = rig.launch(executor = Executor { })
         for (i in 0 until 520) first.track("e$i", null)   // 20 over the cap
         assertEquals(500, first.pendingSignals().size)
         assertEquals("e20", first.pendingSignals().first())

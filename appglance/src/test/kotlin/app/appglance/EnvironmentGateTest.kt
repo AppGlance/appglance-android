@@ -105,7 +105,7 @@ class EnvironmentGateTest {
                 appId = "a",
                 environment = AppEnvironment.BETA,
                 flushInterval = 1.hours,
-                maxBatchSize = 1000,
+                maxBatchSize = 500,
             ),
         )
         beta.track("x", null)

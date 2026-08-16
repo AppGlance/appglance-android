@@ -209,8 +209,8 @@ internal fun testConfiguration(
     enabledEnvironments: Set<AppEnvironment> = AppEnvironment.values().toSet(),
     isEnabled: Boolean = true,
     debug: Boolean = false,
-    maxBatchSize: Int = 1000, // no size-triggered flushes
-    flushInterval: Duration = 1.hours, // and no timer-triggered ones
+    maxBatchSize: Int = 500, // the highest valid value, so size never triggers a send below 500 queued
+    flushInterval: Duration = 1.hours, // and the timer never does either
 ) = AppGlance.Configuration(
     apiKey = apiKey,
     appId = appId,
