@@ -35,6 +35,7 @@ Create an app in the [dashboard](https://appglance.app), copy its write key, and
 SDK in `Application.onCreate()`:
 
 ```kotlin
+import android.app.Application
 import app.appglance.AppGlance
 
 class MyApp : Application() {
@@ -44,6 +45,17 @@ class MyApp : Application() {
     }
 }
 ```
+
+Then name that class in your `AndroidManifest.xml`, or Android never builds it:
+
+```xml
+<application android:name=".MyApp" …>
+```
+
+Android instantiates `android.app.Application` unless the manifest says otherwise, so without
+that attribute `onCreate` above never runs, `configure` is never called, and the SDK sends
+nothing and logs nothing - there is no SDK running to log it. If your app already has an
+`Application` subclass, put the `configure` call in that one rather than adding a second.
 
 That is the whole setup. The SDK watches the app's foreground/background state through
 `ProcessLifecycleOwner`: it records `session.start` when the app comes to the front after more
