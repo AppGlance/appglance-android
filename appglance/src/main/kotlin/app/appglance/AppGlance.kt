@@ -1,10 +1,13 @@
 package app.appglance
 
+import android.app.Application
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.Process
+import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -185,6 +188,7 @@ public object AppGlance {
     internal var transportFactory: (Configuration) -> Transport = { HttpTransport(it.endpoint, it.apiKey) }
     internal var platformFactory: (Context) -> Platform = { AndroidPlatform(it) }
     internal var now: () -> Long = System::currentTimeMillis
+    internal var processName: () -> String? = { currentProcessName() }
 
     // state (command thread only)
     private var client: Client? = null
@@ -221,9 +225,52 @@ public object AppGlance {
     @JvmStatic
     public fun configure(context: Context, configuration: Configuration) {
         val app = context.applicationContext ?: context
+        if (!isMainProcess(app)) return
         val at = now()
         handler.post { onConfigure(Command.Configure(app, configuration, at)) }
-        if (configuration.trackAppLifecycle) LifecycleBridge.install()
+        if (configuration.trackAppLifecycle) LifecycleBridge.install(app) else LifecycleBridge.uninstall()
+    }
+
+    /**
+     * Collection happens in the app's main process only, and a secondary one says so and stops
+     * here.
+     *
+     * `Application.onCreate` runs once per process, so an app that declares `android:process` on a
+     * service or a provider - a crash reporter's own process, a `:sync` service - would otherwise
+     * get a second, fully independent client on the same queue file and the same preference keys.
+     * Neither can be shared: the file store rewrites the whole file from its own in-memory queue,
+     * so whichever process writes last erases what the other still owed, and on a first launch
+     * both find no install id, both mint one and both record `install`, leaving the dashboard a
+     * phantom install and a phantom user for one real device. Making the file and every key carry
+     * the process name would fix the collision, but the on-disk names are frozen (see
+     * CONTRIBUTING.md), so that is a migration rather than a guard.
+     */
+    private fun isMainProcess(context: Context): Boolean {
+        val process = processName() ?: return true   // no answer: assume the main process
+        if (process == context.packageName) return true
+        Log.line(
+            "not collecting in this process: AppGlance runs in the app's main process only, and this is " +
+                "\"$process\". Sessions, presence and the offline queue are one app's state and two processes " +
+                "cannot share them. Track from the main process instead.",
+        )
+        return false
+    }
+
+    /** The running process's name, or null when the platform will not say. */
+    private fun currentProcessName(): String? = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            Application.getProcessName()
+        } else {
+            // No API for it before 28. `/proc/self/cmdline` is the process name, NUL-terminated.
+            File("/proc/self/cmdline").readBytes()
+                .takeWhile { it != 0.toByte() }
+                .toByteArray()
+                .toString(Charsets.UTF_8)
+                .trim()
+                .ifEmpty { null }
+        }
+    } catch (_: Exception) {
+        null
     }
 
     /**
@@ -434,6 +481,7 @@ public object AppGlance {
         val old = pump
         pump = Pump()
         old.thread.quitSafely()
+        LifecycleBridge.uninstall()
         onCommandThread {
             client?.shutdown()
             client = null
@@ -443,6 +491,7 @@ public object AppGlance {
         transportFactory = { HttpTransport(it.endpoint, it.apiKey) }
         platformFactory = { AndroidPlatform(it) }
         now = System::currentTimeMillis
+        processName = { currentProcessName() }
     }
 
     // endregion

@@ -8,6 +8,41 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
 
 ## [Unreleased]
 
+### Fixed
+
+- Sessions and presence keep working when the host app removes androidx.startup's
+  `InitializationProvider` from its manifest, a documented cold-start trim. `ProcessLifecycleOwner`
+  reports nothing without it, so the SDK saw no foreground transition at all: no `session.start`, no
+  presence ping and no flush on background, while `install` and every `track` call still shipped.
+  The dashboard looked healthy and was quietly wrong. The SDK now notices, watches the app's
+  activities directly instead, and logs one line naming the missing provider.
+- `trackAppLifecycle = false` on a later `configure` detaches the lifecycle observer. It was honored
+  only on the first call, so an app that turned it off to draw its own session boundaries with
+  `setActive` kept getting the platform's transitions interleaved with its own.
+- A presence ping that is dropped rather than retried no longer spends a whole fresh interval. The
+  stamp that paces the next ping is written when the ping is queued, so a batch answered with a
+  `5xx` or a `429`, or one whose connection died after connecting, left the install silent for two
+  intervals. At the four-minute cadence a free-plan account is asked for, that is longer than the
+  dashboard's five-minute presence window, so an app in the foreground the whole time dropped out of
+  "active right now" for about three minutes. The next ping is now measured from the last ping the
+  server acknowledged.
+- The last-real-event stamp is persisted alongside the last-ping stamp, so a relaunch or a second
+  `configure` inside the session timeout no longer pings the moment it comes up. A visit shorter than
+  one interval leaves no ping stamp behind and a resumed session records no `session.start`, so the
+  fresh process had no proof of presence of its own however recently the server had heard from that
+  install. Low-RAM devices relaunch inside a visit routinely.
+- `configure` outside the app's main process records nothing and logs why. `Application.onCreate`
+  runs once per process, so an app with an `android:process` component got a second, fully
+  independent client on the same queue file and the same preference keys: two writers of one file,
+  each rewriting it from its own in-memory queue, and on a first launch two install ids and two
+  `install` events for one device.
+
+### Changed
+
+- The README's setup section describes the presence ping the SDK actually sends (one after an
+  interval of silence, none while real events are flowing, and a sparser cadence when the server
+  asks for one), and its Gradle snippet is at the current version.
+
 ## [1.1.0] - 2026-08-17
 
 ### Changed

@@ -72,11 +72,18 @@ internal class Client(
     private var lastActiveAt: Long? = null
     private var lastHeartbeatAt: Long? = null
     /**
-     * When this process last recorded a real (non-heartbeat) event. A real event proves presence
+     * The newest ping the server has acknowledged. Seeded in `init` and thereafter written and
+     * read on the send loop only, which is serial; see [rollBackHeartbeatStamp].
+     */
+    private var deliveredHeartbeatAt: Long? = null
+    /**
+     * When this install last recorded a real (non-heartbeat) event. A real event proves presence
      * exactly as a ping does - the server moves the same "last seen" stamps for both - so the
      * heartbeat waits for `heartbeatInterval` of *silence*, measured from the later of this and
-     * [lastHeartbeatAt]. Memory only: a relaunch either resumes (the persisted ping stamp still
-     * paces it) or starts a session, which is itself an event.
+     * [lastHeartbeatAt]. Persisted for the same reason the ping stamp is: a relaunch inside
+     * `sessionTimeout` resumes and records no `session.start`, and a session shorter than one
+     * interval leaves no ping stamp behind either, so without this a fresh process would owe a
+     * ping at once however recently the app was really heard from.
      */
     private var lastEventAt: Long? = null
 
@@ -94,6 +101,7 @@ internal class Client(
     private var sessionIdPreminted = false
     private val lastActiveKey = "lastActive.$appId"
     private val lastHeartbeatKey = "lastHeartbeat.$appId"
+    private val lastEventKey = "lastEvent.$appId"
     private val heartbeatFloorKey = "heartbeatFloor.$appId"
     private val sessionKey = "session.$appId"
     private val pendingSessionKey = "session.pending.$appId"
@@ -114,6 +122,13 @@ internal class Client(
         // a wall-clock promise, at most one presence ping per interval, and the server folds pings
         // into additive rollups that a doubled tick would inflate.
         lastHeartbeatAt = prefs.getLong(lastHeartbeatKey)
+        // A ping an earlier process stamped is the best proof of delivery this one can have: the
+        // queue file never holds a ping that was in flight, so there is nothing left to re-send
+        // either way. A roll-back therefore undoes only this process's own unconfirmed pings.
+        deliveredHeartbeatAt = lastHeartbeatAt
+        // The event stamp comes back with it - it is the other half of the silence the interval
+        // measures, and a resumed session records no event of its own to replace it.
+        lastEventAt = prefs.getLong(lastEventKey)
         serverHeartbeatFloorMillis = prefs.getLong(heartbeatFloorKey)?.takeIf { isSaneHeartbeatFloorMillis(it) }
         premintSessionIdIfNeeded()
         traits = prefs.getString(traitsKey)?.let(::decodeTraits) ?: emptyMap()
@@ -218,8 +233,12 @@ internal class Client(
             queue.size
         }
         // A real event is presence: the next ping is due only after an interval of silence from
-        // here. (Ping stamps are kept separately, in [heartbeat], and persisted.)
-        if (signal != Signal.HEARTBEAT) lastEventAt = event.clientTs
+        // here. (Ping stamps are kept separately, in [heartbeat].) Persisted like the ping stamp,
+        // on the code path that just wrote the queue file anyway, so one small write more.
+        if (signal != Signal.HEARTBEAT) {
+            lastEventAt = event.clientTs
+            prefs.putLong(lastEventKey, event.clientTs)
+        }
         log {
             "▸ $signal" + (if (signal == Signal.HEARTBEAT) " (presence ping)" else "") +
                 (metadata?.let { " $it" } ?: "")
@@ -445,6 +464,55 @@ internal class Client(
     }
 
     /**
+     * Remembers the newest ping in a batch the server accepted. Called from the send loop.
+     */
+    private fun noteDeliveredHeartbeats(batch: List<Event>) {
+        val newest = batch.filter { it.signal == Signal.HEARTBEAT }.maxOfOrNull { it.clientTs } ?: return
+        if (newest > (deliveredHeartbeatAt ?: Long.MIN_VALUE)) deliveredHeartbeatAt = newest
+    }
+
+    /**
+     * Undoes the stamp of a ping that [requeue] has just dropped, putting it back to the newest
+     * ping the server acknowledged.
+     *
+     * The stamp is written when a ping is *queued*, because it is what paces the timer and a ping
+     * still on the wire must not earn a second one. But a dropped ping is one the server may never
+     * have seen, and leaving its stamp in place spends a whole fresh interval before the install
+     * proves presence again. At 60 s that costs a minute of resolution on a chart that is
+     * approximate by design; at the four-minute cadence a free-plan account is asked for, two
+     * intervals back to back are longer than the dashboard's five-minute presence window, so an
+     * install that is in the foreground the whole time drops out of "active right now" for three
+     * of them. Re-arming from the last acknowledged ping instead measures the silence that is
+     * really outstanding, and the replacement never piles up: the next failure drops the ping this
+     * one queues, so at most one unacknowledged ping is ever in the queue.
+     *
+     * The trade is one tick against another. If the dropped ping did land after all - a reply lost
+     * on the way back - the replacement is a second tick inside one interval, exactly the size of
+     * error a dropped tick is when it did not land. The answered failures that can reach a
+     * presence-only batch (a 429, an edge 5xx, a connection dropped after connect) are
+     * overwhelmingly ones the ingest never applied, and presence is the number the product is read
+     * for, so proving it again is the right way round. [MIN_HEARTBEAT_RETRY_MILLIS] keeps the two
+     * apart in the case where it was not.
+     *
+     * Called from the send loop, so the stamp and the timer are touched back on the command
+     * thread that owns them, and only while the batch's own stamp is still the current one.
+     */
+    private fun rollBackHeartbeatStamp(newestDropped: Long) {
+        val restored = deliveredHeartbeatAt
+        scheduler.post {
+            if (retired) return@post
+            val current = lastHeartbeatAt ?: return@post
+            if (current > newestDropped) return@post   // a later ping was stamped meanwhile; it paces us now
+            lastHeartbeatAt = restored
+            if (restored == null) prefs.remove(lastHeartbeatKey) else prefs.putLong(lastHeartbeatKey, restored)
+            if (isActive) {
+                stopHeartbeat()
+                scheduleHeartbeat(maxOf(millisUntilNextHeartbeat(), MIN_HEARTBEAT_RETRY_MILLIS))
+            }
+        }
+    }
+
+    /**
      * The server's answer to a batch may carry `heartbeat_interval` (seconds): the sparsest
      * presence cadence the account's plan needs. It is a floor, never a ceiling - an app that
      * configured a longer interval keeps it - and it is remembered across launches. Out-of-range
@@ -531,6 +599,7 @@ internal class Client(
                         persistLocked()
                     }
                     log { "✓ sent $count" }
+                    noteDeliveredHeartbeats(batch)
                     adoptHeartbeatFloor(transport.lastHeartbeatIntervalSeconds())
                 }
 
@@ -599,6 +668,9 @@ internal class Client(
         if (dropped > 0) {
             val (noun, pronoun) = if (dropped == 1) "presence ping" to "it" else "presence pings" to "them"
             log { "· dropped $dropped $noun rather than risk counting $pronoun twice" }
+            // Dropped, so not proof of anything: the next ping is owed from the last one the
+            // server acknowledged, not from these. See [rollBackHeartbeatStamp].
+            rollBackHeartbeatStamp(batch.filter { it.signal == Signal.HEARTBEAT }.maxOf { it.clientTs })
         }
         synchronized(queueLock) {
             inFlightBatch = emptyList()
@@ -667,6 +739,15 @@ internal class Client(
 
         /** A background transition sends one last ping if the server has heard nothing for this long. */
         const val CLOSING_TICK_AFTER_MILLIS: Long = 60_000L
+
+        /**
+         * The soonest a ping may replace one that was dropped (see [rollBackHeartbeatStamp]). Far
+         * enough out that a ping which did land after all is not followed by a second tick in the
+         * same second; short enough that the sparsest cadence a plan asks for (240 s) plus one
+         * dropped ping still keeps the install inside the dashboard's five-minute presence window.
+         * It is also the finest presence resolution `heartbeatInterval` itself allows.
+         */
+        const val MIN_HEARTBEAT_RETRY_MILLIS: Long = 15_000L
 
         /**
          * Events per request. The ingest API accepts up to 500 events / 256 KB per batch; a

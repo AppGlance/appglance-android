@@ -13,7 +13,7 @@ id, and one call of setup. Sessions and presence are handled for you. The Swift 
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation("app.appglance:appglance:1.0.1")
+    implementation("app.appglance:appglance:1.1.0")
 }
 ```
 
@@ -47,9 +47,11 @@ class MyApp : Application() {
 
 That is the whole setup. The SDK watches the app's foreground/background state through
 `ProcessLifecycleOwner`: it records `session.start` when the app comes to the front after more
-than five minutes away, keeps a once-a-minute presence ping running while it is in front, and
-flushes when it leaves. Brief interruptions do not start a new session; neither does a kill and
-relaunch inside the timeout. Nothing to attach to activities.
+than five minutes away, sends a presence ping once the app has been in front for a minute with
+nothing else sent - a real event proves presence exactly as a ping does, so an app that is
+sending events never pings - and flushes when it leaves. The server may ask for a sparser cadence
+for your account's plan, and the SDK then uses that. Brief interruptions do not start a new
+session; neither does a kill and relaunch inside the timeout. Nothing to attach to activities.
 
 **See yourself on the dashboard while integrating.** By default emulator runs and debuggable
 builds send nothing, so your numbers only ever contain real installs. Turn on debug mode while
@@ -143,6 +145,10 @@ dashboard exactly like an App Store build.
 - Retries never double-count. Every event carries a client-minted id and the ingest ignores
   replays; the presence ping - which is folded into rollups on arrival - is re-sent only when the
   server provably never saw it, and the on-disk queue never holds a ping that is in flight.
+- Collection runs in the app's main process only. `Application.onCreate` runs once per process, and
+  one install's queue file, session and presence state cannot be shared by two of them, so
+  `configure` from a component with `android:process` logs one line and records nothing. Track from
+  the main process instead.
 
 ## Google Play Data safety
 

@@ -78,9 +78,11 @@ class ReconfigureTest {
             1,
             signals.count { it == Signal.SESSION_START },
         )
-        assertTrue(
-            "and it is live right away: a fresh client has no proof of presence of its own, so it pings at once",
-            signals.count { it == Signal.HEARTBEAT } > heartbeatsBefore,
+        assertEquals(
+            "and it pings no sooner than the first client would have: the presence stamps are the install's, " +
+                "not the client object's, so the session.start a moment ago still counts",
+            heartbeatsBefore,
+            signals.count { it == Signal.HEARTBEAT },
         )
     }
 

@@ -159,8 +159,8 @@ class AppGlanceFacadeTest {
         AppGlance.awaitSenderIdle()
         assertEquals(listOf(Signal.INSTALL, Signal.SESSION_START), transport.signals())
         // Installing the real bridge (ProcessLifecycleOwner) must be safe to call any number of times.
-        LifecycleBridge.install()
-        LifecycleBridge.install()
+        LifecycleBridge.install(app)
+        LifecycleBridge.install(app)
     }
 
     @Test
@@ -179,6 +179,33 @@ class AppGlanceFacadeTest {
             second.pendingSignals(),
         )
         assertTrue("the retired client holds nothing", first.pendingSignals().isEmpty())
+    }
+
+    /**
+     * `Application.onCreate` runs once per process, so an app with an `android:process` component
+     * would otherwise get a second client on the same queue file and the same preference keys -
+     * two writers of one file, each rewriting it from its own in-memory queue, and on a first
+     * launch two install ids and two `install` events for one device. A secondary process collects
+     * nothing and says so.
+     */
+    @Test
+    fun `configure outside the main process records nothing and says why`() {
+        val lines = ArrayList<String>()
+        val previousSink = Log.sink
+        Log.sink = { lines += it }
+        try {
+            AppGlance.processName = { "${app.packageName}:sync" }
+            AppGlance.configure(app, config())
+            AppGlance.track("from.the.sync.service")
+            AppGlance.drain()
+            assertNull("no client, so nothing is written and nothing is sent", AppGlance.currentClientForTesting())
+            assertTrue(
+                "and the developer is told, once, rather than wondering",
+                lines.any { it.startsWith("not collecting in this process") },
+            )
+        } finally {
+            Log.sink = previousSink
+        }
     }
 
     @Test

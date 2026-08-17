@@ -137,6 +137,74 @@ class SessionTest {
     }
 
     /**
+     * The stamps that pace presence belong to the install, not to the client object. A relaunch
+     * inside the session timeout resumes and records no `session.start` of its own, and a visit
+     * shorter than one interval leaves no ping stamp behind either - so without the persisted
+     * event stamp the fresh process would ping the moment it came up, seconds after the server
+     * last heard from that install. Low-RAM devices kill and relaunch inside a visit routinely,
+     * and a second `configure` (the documented way to apply a consent change) is the same shape.
+     */
+    @Test
+    fun `a relaunch inside the timeout owes no ping for silence it did not have`() {
+        val rig = Rig()
+        val first = rig.launch()
+        first.setActive(true)                        // session.start at t0: presence enough, no ping owed
+        rig.scheduler.settle()
+        rig.clock.advance(20.seconds)
+        first.setActive(false)                       // 20 s of quiet: no closing ping either
+        first.flush()
+        assertEquals(0, rig.transport.signals().count { it == Signal.HEARTBEAT })
+
+        rig.clock.advance(10.seconds)                // killed at t20, reopened at t30, inside the timeout
+        val second = rig.launch()
+        second.setActive(true)                       // a resume: no session.start to prove presence with
+        rig.scheduler.settle()
+        assertEquals(
+            "the server heard from this install 30 s ago; a fresh process does not owe a ping for that",
+            0,
+            second.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+        rig.scheduler.advance(30.seconds)            // t60: a full minute since the last real event
+        assertEquals(1, second.pendingSignals().count { it == Signal.HEARTBEAT })
+    }
+
+    /**
+     * A ping that was dropped rather than retried is not proof of anything: the next one is owed
+     * from the last ping the server acknowledged, not from the one it may never have seen. Left
+     * alone, a single drop at the four-minute cadence a free-plan account is asked for opens an
+     * eight-minute gap and the install falls out of the dashboard's five-minute presence window
+     * while it is in the foreground the whole time.
+     */
+    @Test
+    fun `a dropped ping does not spend its whole interval`() {
+        val rig = Rig()
+        val client = rig.launch()
+        client.setActive(true)                       // session.start at t0
+        rig.scheduler.advance(60.seconds)            // a quiet minute: one ping, stamped t60
+        assertEquals(1, client.pendingSignals().count { it == Signal.HEARTBEAT })
+
+        rig.transport.script(503)
+        client.flush()                               // the server answered, so the ping is dropped
+        assertTrue(
+            "dropped rather than risked twice",
+            client.pendingSignals().none { it == Signal.HEARTBEAT },
+        )
+
+        rig.scheduler.advance(Client.MIN_HEARTBEAT_RETRY_MILLIS - 1)
+        assertEquals(
+            "not instantly: the dropped ping may have landed after all",
+            0,
+            client.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+        rig.scheduler.advance(1)
+        assertEquals(
+            "but long before t120 - the server has had no proof of presence since t0",
+            1,
+            client.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+    }
+
+    /**
      * The server may raise the cadence for the account's plan through the ingest response; the
      * SDK obeys it as a floor, remembers it across launches, and ignores nonsense.
      */
