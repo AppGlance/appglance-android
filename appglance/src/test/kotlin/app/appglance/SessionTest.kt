@@ -11,6 +11,7 @@ import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
@@ -48,7 +49,7 @@ class SessionTest {
     }
 
     @Test
-    fun `launch starts exactly one session and one heartbeat`() {
+    fun `launch starts exactly one session and no ping until a minute of silence`() {
         val rig = Rig()
         val client = rig.launch()
 
@@ -58,10 +59,137 @@ class SessionTest {
         rig.scheduler.settle()
 
         assertEquals(
-            "one session.start then one heartbeat - never two of either",
+            "one session.start and nothing else: the start is presence enough",
+            listOf(Signal.SESSION_START),
+            client.pendingSignals(),
+        )
+        rig.scheduler.advance(60.seconds)
+        assertEquals(
+            "a minute of silence earns exactly one ping",
             listOf(Signal.SESSION_START, Signal.HEARTBEAT),
             client.pendingSignals(),
         )
+    }
+
+    /**
+     * The heartbeat measures silence, not time: any real event resets it, so an install that is
+     * sending events never pings, and one that goes quiet pings once per interval of quiet.
+     */
+    @Test
+    fun `a ping is sent only after an interval of silence`() {
+        val rig = Rig()
+        val client = rig.launch()
+        client.setActive(true)                       // session.start at t0
+        rig.scheduler.advance(40.seconds)
+        client.track("tap", null)                    // presence proved at t40
+        rig.scheduler.advance(50.seconds)            // t90: 90 s since the start, only 50 s since the tap
+        assertEquals("the event reset the silence", 0, client.pendingSignals().count { it == Signal.HEARTBEAT })
+        rig.scheduler.advance(10.seconds)            // t100: a full minute since the tap
+        assertEquals(listOf(Signal.SESSION_START, "tap", Signal.HEARTBEAT), client.pendingSignals())
+        rig.scheduler.advance(59.seconds)
+        client.track("tap", null)                    // t159, just before the next ping would be due
+        rig.scheduler.advance(30.seconds)            // t189: 89 s since the ping, 30 s since the tap
+        assertEquals("pushed out again", 1, client.pendingSignals().count { it == Signal.HEARTBEAT })
+        rig.scheduler.advance(30.seconds)            // t219: 60 s since the tap
+        assertEquals(2, client.pendingSignals().count { it == Signal.HEARTBEAT })
+    }
+
+    /**
+     * Leaving the foreground after more than a minute of silence sends one closing ping, so the
+     * session's length ends where the visit ended; leaving sooner sends nothing extra.
+     */
+    @Test
+    fun `leaving after a quiet minute sends a closing ping`() {
+        val rig = Rig()
+        val client = makeClient(
+            rig.platform,
+            rig.clock,
+            rig.scheduler,
+            rig.transport,
+            config = testConfiguration(heartbeatInterval = 1.hours), // no periodic ping in this test
+        )
+        client.setActive(true)                       // session.start at t0
+        rig.clock.advance(30.seconds)
+        client.setActive(false)                      // 30 s of quiet: nothing to add
+        assertEquals(listOf(Signal.SESSION_START), rig.transport.signals())
+
+        rig.clock.advance(10.seconds)
+        client.setActive(true)                       // resumed
+        rig.clock.advance(90.seconds)                // a quiet minute and a half
+        client.setActive(false)
+        assertEquals(
+            "quiet for over a minute: the goodbye is one ping, stamped at the moment of leaving",
+            listOf(Signal.SESSION_START, Signal.HEARTBEAT),
+            rig.transport.signals(),
+        )
+
+        rig.clock.advance(10.seconds)
+        client.setActive(true)
+        rig.clock.advance(20.seconds)
+        client.track("tap", null)
+        rig.clock.advance(20.seconds)
+        client.setActive(false)                      // 20 s since the tap: the server already knows
+        assertEquals(
+            "a recent event is presence enough: no closing ping",
+            listOf(Signal.SESSION_START, Signal.HEARTBEAT, "tap"),
+            rig.transport.signals(),
+        )
+    }
+
+    /**
+     * The server may raise the cadence for the account's plan through the ingest response; the
+     * SDK obeys it as a floor, remembers it across launches, and ignores nonsense.
+     */
+    @Test
+    fun `the server heartbeat floor is honoured remembered and bounded`() {
+        val rig = Rig()
+        val first = rig.launch()
+        assertEquals(60_000L, first.heartbeatIntervalMillis())
+
+        rig.transport.heartbeatIntervalSeconds = 240
+        first.track("a", null)
+        first.flush()
+        assertEquals("the plan asks for a ping every four minutes at most", 240_000L, first.heartbeatIntervalMillis())
+
+        // And the timer follows: quiet from here, the next ping is four minutes out, not one.
+        first.setActive(true)                        // session.start now
+        rig.scheduler.advance(3.minutes)
+        assertEquals(0, first.pendingSignals().count { it == Signal.HEARTBEAT })
+        rig.scheduler.advance(1.minutes)
+        assertEquals(1, first.pendingSignals().count { it == Signal.HEARTBEAT })
+
+        // Remembered: the next launch paces itself before its first response arrives.
+        val second = rig.launch()
+        assertEquals(240_000L, second.heartbeatIntervalMillis())
+
+        // A floor, not a ceiling: an app that configured 5 minutes keeps them.
+        val wide = makeClient(
+            rig.platform,
+            rig.clock,
+            rig.scheduler,
+            rig.transport,
+            config = testConfiguration(heartbeatInterval = 5.minutes),
+        )
+        assertEquals(300_000L, wide.heartbeatIntervalMillis())
+
+        // Nonsense is ignored: too tight to mean anything, or not a presence cadence at all.
+        rig.transport.heartbeatIntervalSeconds = 5
+        second.track("b", null)
+        second.flush()
+        assertEquals("below the sane floor: the last good value stands", 240_000L, second.heartbeatIntervalMillis())
+        rig.transport.heartbeatIntervalSeconds = 86_400
+        second.track("c", null)
+        second.flush()
+        assertEquals("a day is not a presence cadence: kept 240 s", 240_000L, second.heartbeatIntervalMillis())
+        // Back down when the plan changes; a response with no hint changes nothing.
+        rig.transport.heartbeatIntervalSeconds = 60
+        second.track("d", null)
+        second.flush()
+        assertEquals(60_000L, second.heartbeatIntervalMillis())
+        rig.transport.heartbeatIntervalSeconds = null
+        second.track("e", null)
+        second.flush()
+        assertEquals(60_000L, second.heartbeatIntervalMillis())
     }
 
     @Test
@@ -87,24 +215,23 @@ class SessionTest {
             sent.count { it == Signal.SESSION_START },
         )
         assertEquals(
-            "resuming inside the heartbeat interval must not tick again immediately",
-            1,
+            "resuming inside the interval since session.start must not tick, and 20 s of quiet earns no closing ping",
+            0,
             sent.count { it == Signal.HEARTBEAT },
         )
         assertTrue("a successful flush clears the queue - nothing to replay later", client.pendingSignals().isEmpty())
     }
 
     @Test
-    fun `the heartbeat keeps ticking every interval while active and stops when inactive`() {
+    fun `the heartbeat keeps ticking every quiet interval while active and stops when inactive`() {
         val rig = Rig()
         val client = rig.launch()
-        client.setActive(true)
-        rig.scheduler.settle()
-        rig.scheduler.advance(3.minutes)             // three more ticks at 60 s spacing
-        assertEquals(1 + 3, client.pendingSignals().count { it == Signal.HEARTBEAT })
+        client.setActive(true)                       // session.start at t0
+        rig.scheduler.advance(3.minutes)             // three ticks at 60 s spacing: t60, t120, t180
+        assertEquals(3, client.pendingSignals().count { it == Signal.HEARTBEAT })
 
         client.setActive(false)                      // flushes: everything so far is on the server
-        assertEquals(4, rig.transport.signals().count { it == Signal.HEARTBEAT })
+        assertEquals(3, rig.transport.signals().count { it == Signal.HEARTBEAT })
         rig.scheduler.advance(30.seconds)            // nothing ticks while backgrounded
         assertTrue(client.pendingSignals().isEmpty())
 
@@ -115,12 +242,12 @@ class SessionTest {
         rig.scheduler.advance(30.seconds)
         assertEquals("one when the interval completes", 1, client.pendingSignals().count { it == Signal.HEARTBEAT })
 
-        // A long absence is a new session, and its first beat is immediate.
+        // A long absence is a new session; its start is its first proof of presence.
         client.setActive(false)
         rig.scheduler.advance(10.minutes)
         client.setActive(true)
         rig.scheduler.settle()
-        assertEquals(listOf(Signal.SESSION_START, Signal.HEARTBEAT), client.pendingSignals())
+        assertEquals(listOf(Signal.SESSION_START), client.pendingSignals())
     }
 
     @Test
@@ -138,8 +265,8 @@ class SessionTest {
         client.flush()
 
         assertEquals(
-            "each return after the gap is a new session with its own first heartbeat",
-            listOf(Signal.SESSION_START, Signal.HEARTBEAT, Signal.SESSION_START, Signal.HEARTBEAT),
+            "each return after the gap is a new session; its start is its first proof of presence",
+            listOf(Signal.SESSION_START, Signal.SESSION_START),
             rig.transport.signals(),
         )
     }
@@ -343,8 +470,8 @@ class SessionTest {
         try {
             val client = makeClient(rig.platform, rig.clock, rig.scheduler, rig.transport, executor = executor)
 
-            client.setActive(true)              // session.start + heartbeat
-            rig.scheduler.settle()
+            client.setActive(true)              // session.start, then a quiet minute earns a heartbeat
+            rig.scheduler.advance(60.seconds)
             client.track("purchase", null)
             assertEquals(
                 "queued, not yet sent: everything is owed",
@@ -429,7 +556,7 @@ class SessionTest {
         val rig = Rig()
         val client = rig.launch()
         client.setActive(true)
-        rig.scheduler.settle()
+        rig.scheduler.advance(60.seconds)            // a quiet minute: one ping in the queue
         client.track("purchase", null)
 
         // 413 is a definite answer: the body was rejected before anything was processed, so the
@@ -451,7 +578,7 @@ class SessionTest {
         val rig = Rig()
         val client = rig.launch()
         client.setActive(true)
-        rig.scheduler.settle()
+        rig.scheduler.advance(60.seconds)            // a quiet minute: one ping in the queue
 
         // No connection was ever established, so nothing on the other end could have counted the
         // ping. Offline is the ordinary case the on-disk queue exists for - discarding presence
@@ -489,7 +616,7 @@ class SessionTest {
 
         val events = rig.transport.batches().flatten()
         assertEquals(
-            listOf(Signal.INSTALL, "early", Signal.SESSION_START, Signal.HEARTBEAT),
+            listOf(Signal.INSTALL, "early", Signal.SESSION_START),
             events.map { it.signal },
         )
         val ids = events.map { it.sessionId }.toSet()
@@ -541,7 +668,7 @@ class SessionTest {
         val events = rig.transport.batches().flatten()
         assertEquals(
             "the install queued by the dead process still opens the batch",
-            listOf(Signal.INSTALL, Signal.SESSION_START, Signal.HEARTBEAT),
+            listOf(Signal.INSTALL, Signal.SESSION_START),
             events.map { it.signal },
         )
         assertEquals("and every event shares the one id", setOf(preminted), events.map { it.sessionId }.toSet())
@@ -567,7 +694,7 @@ class SessionTest {
         second.flush()
 
         val late = rig.transport.batches().last()
-        assertEquals(listOf("from.push", Signal.SESSION_START, Signal.HEARTBEAT), late.map { it.signal })
+        assertEquals(listOf("from.push", Signal.SESSION_START), late.map { it.signal })
         assertEquals(setOf(preminted), late.map { it.sessionId }.toSet())
     }
 

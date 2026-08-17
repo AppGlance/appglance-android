@@ -5,6 +5,7 @@ import java.util.concurrent.Executor
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
 // In-memory stand-ins for everything the core needs from the host. The JVM tests drive the real
 // `Client` through these: no Android, no network, no sleeping - time is a number the test moves.
@@ -92,6 +93,11 @@ internal class RecordingTransport : Transport {
     @Volatile var retryAfterSeconds: Long? = null
 
     override fun lastRetryAfterSeconds(): Long? = retryAfterSeconds
+
+    /** When set, reported as the `heartbeat_interval` (seconds) of every 2xx response body. */
+    @Volatile var heartbeatIntervalSeconds: Long? = null
+
+    override fun lastHeartbeatIntervalSeconds(): Long? = heartbeatIntervalSeconds
 
     fun script(vararg s: Int) = synchronized(lock) {
         statuses.clear()
@@ -216,12 +222,14 @@ internal fun testConfiguration(
     debug: Boolean = false,
     maxBatchSize: Int = 500, // the highest valid value, so size never triggers a send below 500 queued
     flushInterval: Duration = 1.hours, // and the timer never does either
+    heartbeatInterval: Duration = 60.seconds,
 ) = AppGlance.Configuration(
     apiKey = apiKey,
     appId = appId,
     endpoint = endpoint,
     flushInterval = flushInterval,
     maxBatchSize = maxBatchSize,
+    heartbeatInterval = heartbeatInterval,
     sessionTimeout = sessionTimeout,
     isEnabled = isEnabled,
     enabledEnvironments = enabledEnvironments,

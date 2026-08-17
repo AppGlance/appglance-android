@@ -88,6 +88,13 @@ internal interface Transport {
      */
     fun lastRetryAfterSeconds(): Long? = null
 
+    /**
+     * The `heartbeat_interval` (seconds) carried by the most recent 2xx response body, when the
+     * server sent one; null otherwise. The client reads it right after a successful [send]; sends
+     * are serial, so "most recent" is unambiguous.
+     */
+    fun lastHeartbeatIntervalSeconds(): Long? = null
+
     companion object {
         /**
          * The request failed after a connection existed - a timeout, or a connection dropped

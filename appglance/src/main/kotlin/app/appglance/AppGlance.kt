@@ -77,8 +77,13 @@ public object AppGlance {
         /** Send at once when this many events are queued. 1 to 500, the ingest API's per-request maximum. Default 20. */
         public val maxBatchSize: Int = 20,
         /**
-         * Time between presence pings while the app is in the foreground. They power "active right
-         * now" and session length, and are never billable. At least 15 seconds. Default 60 s.
+         * How long the app can be in the foreground with nothing sent before a presence ping goes
+         * out. Pings power "active right now" and session length and are never billable; a real
+         * event proves presence just as well, so a ping is only sent after this long of silence.
+         * At least 15 seconds. Default 60 s. The server may ask for a sparser cadence for the
+         * account's plan; the SDK then uses the larger of the two, so this is a floor you can
+         * raise, not lower. One extra ping goes out when the app leaves the foreground after more
+         * than a minute of silence, so a session's length is exact whatever the cadence.
          */
         public val heartbeatInterval: Duration = 60.seconds,
         /**

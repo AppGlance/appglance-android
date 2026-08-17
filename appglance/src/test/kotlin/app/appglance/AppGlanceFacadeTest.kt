@@ -123,20 +123,23 @@ class AppGlanceFacadeTest {
         AppGlance.setActive(true)      // …and back, all within a moment
         AppGlance.drain()
         val client = assertNotNull(AppGlance.currentClientForTesting())
-        // The heartbeat's first tick is posted with no delay; let the command thread run it, and
-        // let the failed send put its batch back.
+        // Let the command thread settle, and let the failed send put its batch back.
         AppGlance.drain()
         AppGlance.awaitSenderIdle()
         val signals = client.pendingSignals()
         assertEquals("one visit, one session", 1, signals.count { it == Signal.SESSION_START })
-        assertEquals("and exactly one heartbeat so far", 1, signals.count { it == Signal.HEARTBEAT })
-        assertEquals(listOf(Signal.INSTALL, Signal.SESSION_START, Signal.HEARTBEAT), signals)
+        assertEquals(
+            "and no heartbeat: session.start proved presence and nothing has been quiet for a minute",
+            0,
+            signals.count { it == Signal.HEARTBEAT },
+        )
+        assertEquals(listOf(Signal.INSTALL, Signal.SESSION_START), signals)
 
         transport.offline = false
         AppGlance.setActive(false)     // leaving: flush
         AppGlance.drain()
         AppGlance.awaitSenderIdle()
-        assertEquals(listOf(Signal.INSTALL, Signal.SESSION_START, Signal.HEARTBEAT), transport.signals())
+        assertEquals(listOf(Signal.INSTALL, Signal.SESSION_START), transport.signals())
         assertTrue(client.pendingSignals().isEmpty())
     }
 
@@ -150,11 +153,11 @@ class AppGlanceFacadeTest {
         AppGlance.drain()
         AppGlance.drain()
         val client = assertNotNull(AppGlance.currentClientForTesting())
-        assertEquals(listOf(Signal.INSTALL, Signal.SESSION_START, Signal.HEARTBEAT), client.pendingSignals())
+        assertEquals(listOf(Signal.INSTALL, Signal.SESSION_START), client.pendingSignals())
         LifecycleBridge.onStop(owner)
         AppGlance.drain()
         AppGlance.awaitSenderIdle()
-        assertEquals(listOf(Signal.INSTALL, Signal.SESSION_START, Signal.HEARTBEAT), transport.signals())
+        assertEquals(listOf(Signal.INSTALL, Signal.SESSION_START), transport.signals())
         // Installing the real bridge (ProcessLifecycleOwner) must be safe to call any number of times.
         LifecycleBridge.install()
         LifecycleBridge.install()

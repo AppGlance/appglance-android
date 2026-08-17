@@ -71,10 +71,30 @@ internal class Client(
     private var isActive = false
     private var lastActiveAt: Long? = null
     private var lastHeartbeatAt: Long? = null
+    /**
+     * When this process last recorded a real (non-heartbeat) event. A real event proves presence
+     * exactly as a ping does - the server moves the same "last seen" stamps for both - so the
+     * heartbeat waits for `heartbeatInterval` of *silence*, measured from the later of this and
+     * [lastHeartbeatAt]. Memory only: a relaunch either resumes (the persisted ping stamp still
+     * paces it) or starts a session, which is itself an event.
+     */
+    private var lastEventAt: Long? = null
+
+    /**
+     * The server's floor for the presence cadence, in milliseconds, from the ingest response
+     * (`heartbeat_interval`, seconds). Plans differ in how often they need to hear from an install;
+     * the effective interval is the larger of this and the configured one. Written by the send
+     * loop, read on the command thread, hence volatile; persisted so a launch paces itself
+     * correctly before its first response arrives.
+     */
+    @Volatile
+    private var serverHeartbeatFloorMillis: Long? = null
     private var sessionId: String? = null
     /** True while [sessionId] is pre-minted for the coming session and no `session.start` has adopted it yet. */
     private var sessionIdPreminted = false
     private val lastActiveKey = "lastActive.$appId"
+    private val lastHeartbeatKey = "lastHeartbeat.$appId"
+    private val heartbeatFloorKey = "heartbeatFloor.$appId"
     private val sessionKey = "session.$appId"
     private val pendingSessionKey = "session.pending.$appId"
 
@@ -90,6 +110,11 @@ internal class Client(
             lastActiveAt = it
             sessionId = prefs.getString(sessionKey)
         }
+        // The ping stamp survives a relaunch for the same reason the session does: the interval is
+        // a wall-clock promise, at most one presence ping per interval, and the server folds pings
+        // into additive rollups that a doubled tick would inflate.
+        lastHeartbeatAt = prefs.getLong(lastHeartbeatKey)
+        serverHeartbeatFloorMillis = prefs.getLong(heartbeatFloorKey)?.takeIf { isSaneHeartbeatFloorMillis(it) }
         premintSessionIdIfNeeded()
         traits = prefs.getString(traitsKey)?.let(::decodeTraits) ?: emptyMap()
         queueStore.load()?.let { queue.addAll(EventCoding.decode(it)) }
@@ -192,6 +217,9 @@ internal class Client(
             persistLocked()
             queue.size
         }
+        // A real event is presence: the next ping is due only after an interval of silence from
+        // here. (Ping stamps are kept separately, in [heartbeat], and persisted.)
+        if (signal != Signal.HEARTBEAT) lastEventAt = event.clientTs
         log {
             "▸ $signal" + (if (signal == Signal.HEARTBEAT) " (presence ping)" else "") +
                 (metadata?.let { " $it" } ?: "")
@@ -269,6 +297,16 @@ internal class Client(
             startHeartbeat()
         } else {
             stopHeartbeat()
+            // The closing tick. If the server has heard nothing from this install for a while, one
+            // last ping goes out with the flush that follows, so the session's length on the
+            // dashboard ends where the visit actually ended rather than at the last thing that
+            // happened to be sent. Free at a one-minute cadence (the stamp is never that old); one
+            // extra ping per silent visit at the sparser cadences a plan may ask for.
+            if (t - (lastPresenceAt() ?: Long.MIN_VALUE) > CLOSING_TICK_AFTER_MILLIS) {
+                stampHeartbeat(t)
+                track(Signal.HEARTBEAT, null, t)
+                log { "· closing presence ping (quiet for over a minute)" }
+            }
             rememberActive(t)
             flush()
         }
@@ -325,21 +363,60 @@ internal class Client(
         sessionId?.let { prefs.putString(sessionKey, it) } ?: prefs.remove(sessionKey)
     }
 
+    /**
+     * The presence cadence in force: the larger of what the app configured and what the server
+     * asked for. Exposed for tests.
+     */
+    internal fun heartbeatIntervalMillis(): Long =
+        maxOf(config.heartbeatInterval.inWholeMilliseconds, serverHeartbeatFloorMillis ?: 0L)
+
+    /**
+     * The last moment the server has (or will have, once the queue flushes) proof that this
+     * install was in front of someone: the later of the last ping and the last real event.
+     */
+    private fun lastPresenceAt(): Long? {
+        val a = lastHeartbeatAt
+        val b = lastEventAt
+        return when {
+            a == null -> b
+            b == null -> a
+            else -> maxOf(a, b)
+        }
+    }
+
+    /**
+     * Milliseconds until the next ping is due: a full interval of silence after the last proof
+     * of presence. Zero means now - including the case where nothing has been sent yet, such as
+     * a resumed session that started before this process.
+     */
+    private fun millisUntilNextHeartbeat(): Long {
+        val last = lastPresenceAt() ?: return 0L
+        return (heartbeatIntervalMillis() - (now() - last)).coerceAtLeast(0L)
+    }
+
+    /**
+     * One timer per foreground stretch. It never fires blindly every interval: it is scheduled
+     * for when the next ping is due, and when it fires it looks again, because in the meantime a
+     * real event may have proved presence (pushing the due moment out) or the server may have
+     * asked for a sparser cadence. Only when the install has been silent for a whole interval
+     * does it tick.
+     */
     private fun startHeartbeat() {
         stopHeartbeat()
-        // Back from a brief interruption: finish the interval that was running rather than tick
-        // again straight away.
-        val interval = config.heartbeatInterval.inWholeMilliseconds
-        val wait = lastHeartbeatAt?.let { (interval - (now() - it)).coerceAtLeast(0L) } ?: 0L
-        scheduleHeartbeat(wait)
+        scheduleHeartbeat(millisUntilNextHeartbeat())
     }
 
     private fun scheduleHeartbeat(delayMillis: Long) {
         val task = object : Runnable {
             override fun run() {
                 if (heartbeatTask !== this) return   // cancelled or replaced meanwhile
+                val wait = millisUntilNextHeartbeat()
+                if (wait > 0L) {
+                    scheduleHeartbeat(wait)          // something proved presence since; look again then
+                    return
+                }
                 heartbeat()
-                scheduleHeartbeat(config.heartbeatInterval.inWholeMilliseconds)
+                scheduleHeartbeat(heartbeatIntervalMillis())
             }
         }
         heartbeatTask = task
@@ -353,10 +430,39 @@ internal class Client(
 
     private fun heartbeat() {
         val t = now()
-        lastHeartbeatAt = t
+        stampHeartbeat(t)
         rememberActive(t)
         track(Signal.HEARTBEAT, null, t)
     }
+
+    /**
+     * The ping stamp is a wall-clock promise (at most one ping per interval, across relaunches),
+     * so it is persisted the moment it moves.
+     */
+    private fun stampHeartbeat(t: Long) {
+        lastHeartbeatAt = t
+        prefs.putLong(lastHeartbeatKey, t)
+    }
+
+    /**
+     * The server's answer to a batch may carry `heartbeat_interval` (seconds): the sparsest
+     * presence cadence the account's plan needs. It is a floor, never a ceiling - an app that
+     * configured a longer interval keeps it - and it is remembered across launches. Out-of-range
+     * values are ignored rather than obeyed: 15 s is the tightest cadence that has any meaning to
+     * the dashboard's 5-minute presence window, and past an hour a "presence" ping is not one.
+     * Called from the send loop; the timer picks the new value up the next time it looks.
+     */
+    private fun adoptHeartbeatFloor(seconds: Long?) {
+        val millis = (seconds ?: return) * 1_000L
+        if (!isSaneHeartbeatFloorMillis(millis) || millis == serverHeartbeatFloorMillis) return
+        serverHeartbeatFloorMillis = millis
+        prefs.putLong(heartbeatFloorKey, millis)
+        log {
+            "· presence pings at most every ${heartbeatIntervalMillis() / 1_000} s (the server asked for $seconds s)"
+        }
+    }
+
+    private fun isSaneHeartbeatFloorMillis(millis: Long): Boolean = millis in 15_000L..3_600_000L
 
     // endregion
 
@@ -425,6 +531,7 @@ internal class Client(
                         persistLocked()
                     }
                     log { "✓ sent $count" }
+                    adoptHeartbeatFloor(transport.lastHeartbeatIntervalSeconds())
                 }
 
                 status == 413 && batch.size > 1 -> {
@@ -557,6 +664,9 @@ internal class Client(
 
         /** Ceiling on the automatic-retry backoff window. */
         const val MAX_BACKOFF_MILLIS: Long = 60_000L
+
+        /** A background transition sends one last ping if the server has heard nothing for this long. */
+        const val CLOSING_TICK_AFTER_MILLIS: Long = 60_000L
 
         /**
          * Events per request. The ingest API accepts up to 500 events / 256 KB per batch; a

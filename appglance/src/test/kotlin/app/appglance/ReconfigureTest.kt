@@ -61,11 +61,11 @@ class ReconfigureTest {
         registry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)   // the app is in front of the user
         AppGlance.configure(app, config())
         AppGlance.drain()
-        AppGlance.drain()                                          // let the heartbeat's first tick land
+        AppGlance.drain()
         val first = requireNotNull(AppGlance.currentClientForTesting())
-        assertEquals(1, first.pendingSignals().count { it == Signal.SESSION_START })
+        assertEquals("the first configure went active", 1, first.pendingSignals().count { it == Signal.SESSION_START })
         val heartbeatsBefore = first.pendingSignals().count { it == Signal.HEARTBEAT }
-        assertTrue("the first configure went active", heartbeatsBefore >= 1)
+        assertEquals("the start proved presence; no ping yet", 0, heartbeatsBefore)
 
         AppGlance.configure(app, config())                         // a consent change, say
         AppGlance.drain()
@@ -79,7 +79,7 @@ class ReconfigureTest {
             signals.count { it == Signal.SESSION_START },
         )
         assertTrue(
-            "and it is live right away: its own heartbeat ticked without a background-and-return",
+            "and it is live right away: a fresh client has no proof of presence of its own, so it pings at once",
             signals.count { it == Signal.HEARTBEAT } > heartbeatsBefore,
         )
     }
@@ -101,7 +101,7 @@ class ReconfigureTest {
         AppGlance.drain()
         AppGlance.drain()
         assertEquals(
-            listOf(Signal.INSTALL, Signal.SESSION_START, Signal.HEARTBEAT),
+            listOf(Signal.INSTALL, Signal.SESSION_START),
             client.pendingSignals(),
         )
         assertNotNull(client.currentSessionId())

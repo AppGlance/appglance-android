@@ -113,7 +113,7 @@ AppGlance.configure(this, AppGlance.Configuration(
 |---|---|---|
 | `flushInterval` | `10.seconds` | Wait before sending a partial batch. Must be positive. |
 | `maxBatchSize` | `20` | Send at once when this many events are queued. 1 to 500. |
-| `heartbeatInterval` | `60.seconds` | Presence-ping cadence while foregrounded (drives "active now"). Never billable. At least 15 s. |
+| `heartbeatInterval` | `60.seconds` | Seconds of silence in the foreground before a presence ping (drives "active now"). A real event resets it; the server may raise it for the account's plan. Never billable. At least 15 s. |
 | `sessionTimeout` | `5.minutes` | Away longer than this and coming back is a new session - the dashboard splits on the same gap. |
 | `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. |
 | `collectsCountry` | `true` | The device's region *setting* (system locale) as a two-letter code. Not GPS, not IP. |

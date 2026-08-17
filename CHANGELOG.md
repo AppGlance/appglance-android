@@ -8,6 +8,34 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-17
+
+### Changed
+
+- The presence ping now measures silence, not time. A real event proves the app is in front of
+  someone exactly as a ping does (the server moves the same "last seen" and session stamps for
+  both), so a `heartbeat` is sent only after `heartbeatInterval` with nothing else sent — the tick
+  that used to fire at the start of every session alongside `session.start` is gone, an install
+  that keeps sending events never pings, and a quiet one pings once per interval of quiet.
+  Nothing on the dashboard changes: "active right now" and session length read the same stamps as
+  before. What changes is the bill behind the free presence promise, on the server's side:
+  roughly half of all pings were the redundant first one.
+- Leaving the foreground after more than a minute of silence sends one closing ping with the flush
+  the SDK already does, so a session's length ends where the visit ended instead of at the last
+  thing that happened to be sent. At the default cadence the stamp is never that old, so nothing
+  extra is sent; it matters when the server asks for a sparser cadence (below).
+- The last-ping stamp is persisted, so a kill-and-relaunch inside the interval no longer pings
+  again at once (the Swift SDK has done this since 1.0.2).
+
+### Added
+
+- The server may ask for a sparser presence cadence for the account's plan by answering a batch
+  with `heartbeat_interval` (seconds). The SDK obeys it as a floor — the effective interval is the
+  larger of the configured `heartbeatInterval` and the server's value, so an app that configured a
+  longer interval keeps it — remembers it across launches, and ignores values outside 15 s–1 h.
+  Servers that send nothing leave the configured interval in force, so this is fully additive on
+  the wire.
+
 ## [1.0.1] - 2026-08-17
 
 ### Fixed
