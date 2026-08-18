@@ -1,15 +1,16 @@
 package app.appglance
 
-import org.junit.Assert.assertThrows
-import org.junit.Assert.assertTrue
+import org.junit.Assert.assertEquals
 import org.junit.Test
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * Configuration rejects values that could only be mistakes - a zero heartbeat is a tight send
- * loop, a zero batch size could never send - at construction, where the stack trace points at the
- * caller, instead of misbehaving quietly in the field.
+ * Configuration clamps values that could only be mistakes - a zero heartbeat is a tight send loop,
+ * a zero batch size could never send - instead of refusing them: an app that ships a bad number
+ * keeps working, with a cadence it can live with, rather than crashing on the call that configures
+ * its analytics. The Swift SDK holds the same fields to the same bounds.
  */
 class ConfigurationTest {
 
@@ -26,45 +27,38 @@ class ConfigurationTest {
         sessionTimeout = sessionTimeout,
     )
 
-    private fun rejects(field: String, build: () -> AppGlance.Configuration) {
-        val thrown = assertThrows(IllegalArgumentException::class.java) { build() }
-        assertTrue(
-            "the message must name the offending option; got: ${thrown.message}",
-            thrown.message.orEmpty().contains(field),
-        )
+    @Test
+    fun `a heartbeat interval that would be a tight send loop is lifted to the floor`() {
+        assertEquals(15.seconds, config(heartbeatInterval = Duration.ZERO).heartbeatInterval)
+        assertEquals(15.seconds, config(heartbeatInterval = (-30).seconds).heartbeatInterval)
+        assertEquals(15.seconds, config(heartbeatInterval = 14.seconds).heartbeatInterval)
+        assertEquals("the boundary stands", 15.seconds, config(heartbeatInterval = 15.seconds).heartbeatInterval)
+        assertEquals(1.hours, config(heartbeatInterval = Duration.INFINITE).heartbeatInterval)
     }
 
     @Test
-    fun `a zero or negative heartbeat interval is refused, it would be a tight send loop`() {
-        rejects("heartbeatInterval") { config(heartbeatInterval = Duration.ZERO) }
-        rejects("heartbeatInterval") { config(heartbeatInterval = (-30).seconds) }
+    fun `the batch size is held to what the ingest accepts`() {
+        assertEquals(1, config(maxBatchSize = 0).maxBatchSize)
+        assertEquals(1, config(maxBatchSize = -5).maxBatchSize)
+        assertEquals(500, config(maxBatchSize = 501).maxBatchSize)
+        assertEquals(1, config(maxBatchSize = 1).maxBatchSize)
+        assertEquals(500, config(maxBatchSize = 500).maxBatchSize)
     }
 
     @Test
-    fun `the heartbeat floor is fifteen seconds exactly`() {
-        rejects("heartbeatInterval") { config(heartbeatInterval = 14.seconds) }
-        config(heartbeatInterval = 15.seconds)   // the boundary is accepted
+    fun `the flush interval is positive and bounded`() {
+        assertEquals(1.seconds, config(flushInterval = Duration.ZERO).flushInterval)
+        assertEquals(1.seconds, config(flushInterval = (-10).seconds).flushInterval)
+        assertEquals(1.hours, config(flushInterval = 6.hours).flushInterval)
+        assertEquals(10.seconds, config().flushInterval)
     }
 
     @Test
-    fun `the batch size must fit what the ingest accepts`() {
-        rejects("maxBatchSize") { config(maxBatchSize = 0) }
-        rejects("maxBatchSize") { config(maxBatchSize = -5) }
-        rejects("maxBatchSize") { config(maxBatchSize = 501) }
-        config(maxBatchSize = 1)                 // both boundaries are accepted
-        config(maxBatchSize = 500)
-    }
-
-    @Test
-    fun `the flush interval must be positive`() {
-        rejects("flushInterval") { config(flushInterval = Duration.ZERO) }
-        rejects("flushInterval") { config(flushInterval = (-10).seconds) }
-    }
-
-    @Test
-    fun `the session timeout must be positive`() {
-        rejects("sessionTimeout") { config(sessionTimeout = Duration.ZERO) }
-        rejects("sessionTimeout") { config(sessionTimeout = (-1).seconds) }
+    fun `the session timeout is positive and bounded`() {
+        assertEquals(1.seconds, config(sessionTimeout = Duration.ZERO).sessionTimeout)
+        assertEquals(1.seconds, config(sessionTimeout = (-1).seconds).sessionTimeout)
+        assertEquals(24.hours, config(sessionTimeout = 48.hours).sessionTimeout)
+        assertEquals(300.seconds, config().sessionTimeout)
     }
 
     @Test

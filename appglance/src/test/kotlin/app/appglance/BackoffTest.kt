@@ -87,6 +87,21 @@ class BackoffTest {
     }
 
     @Test
+    fun `an absurd Retry-After is clamped to fifteen minutes`() {
+        val rig = Rig()
+        rig.transport.retryAfterSeconds = 86_400     // a day: an outage, not rate limiting
+        rig.transport.script(429)
+        rig.client.track("a", null)
+        rig.client.track("b", null)
+        rig.client.track("c", null)
+        rig.scheduler.advance(899.seconds)
+        assertEquals("the header is obeyed up to the ceiling", listOf(2), rig.transport.requestSizes())
+        rig.scheduler.advance(1.seconds)
+        assertEquals("and never past it", listOf(2, 3), rig.transport.requestSizes())
+        assertTrue(rig.client.pendingSignals().isEmpty())
+    }
+
+    @Test
     fun `an explicit flush ignores the backoff window`() {
         val rig = Rig()
         rig.transport.script(503)

@@ -13,7 +13,7 @@ id, and one call of setup. Sessions and presence are handled for you. The Swift 
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation("app.appglance:appglance:1.1.0")
+    implementation("app.appglance:appglance:1.2.0")
 }
 ```
 
@@ -125,10 +125,10 @@ AppGlance.configure(this, AppGlance.Configuration(
 
 | Option | Default | Notes |
 |---|---|---|
-| `flushInterval` | `10.seconds` | Wait before sending a partial batch. Must be positive. |
-| `maxBatchSize` | `20` | Send at once when this many events are queued. 1 to 500. |
-| `heartbeatInterval` | `60.seconds` | Seconds of silence in the foreground before a presence ping (drives "active now"). A real event resets it; the server may raise it for the account's plan. Never billable. At least 15 s. |
-| `sessionTimeout` | `5.minutes` | Away longer than this and coming back is a new session - the dashboard splits on the same gap. |
+| `flushInterval` | `10.seconds` | Wait before sending a partial batch. Clamped to 1 s - 1 h. |
+| `maxBatchSize` | `20` | Send at once when this many events are queued. Clamped to 1 - 500, the largest batch the ingest API accepts. |
+| `heartbeatInterval` | `60.seconds` | Seconds of silence in the foreground before a presence ping (drives "active now"). A real event resets it; the server may raise it for the account's plan. Never billable. Clamped to 15 s - 1 h: there is no way to switch presence off here. |
+| `sessionTimeout` | `5.minutes` | Away longer than this and coming back is a new session - the dashboard splits on the same gap. Clamped to 1 s - 24 h. |
 | `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. |
 | `collectsCountry` | `true` | The device's region *setting* (system locale) as a two-letter code. Not GPS, not IP. |
 | `enabledEnvironments` | `{PRODUCTION, BETA}` | Which environments send; emulator runs and debuggable builds never do by default. |
@@ -148,15 +148,19 @@ dashboard exactly like an App Store build.
   background thread, timestamps are taken at call time, and calls made before `configure` (or
   before the user's first unlock under Direct Boot) are held - up to 200 - and replayed.
 - The install id is a random UUID in the app's `SharedPreferences`, inside Auto Backup, so a
-  reinstall on the same account usually keeps it. `install` is recorded exactly once, first.
+  reinstall on the same account usually keeps it. It is stored with a marker for the device that
+  minted it, so a backup or a transfer restored onto a second handset mints a fresh id there
+  rather than reporting two devices as one. `install` is recorded exactly once, first.
 - Events are persisted to `noBackupFilesDir` as they are tracked, so a crash loses nothing. The
   queue is capped at 500 (oldest dropped), sent oldest-first in slices of 100, one send at a
   time. `429`, `5xx` and offline keep the batch for later, with exponential backoff between
-  automatic retries (a numeric `Retry-After` is honored); `413` halves it; any other `4xx` (a
-  wrong key, say) drops that slice rather than wedging the queue.
+  automatic retries (a numeric `Retry-After` is honored, up to fifteen minutes); `413` halves it;
+  any other `4xx` (a wrong key, say) drops that slice rather than wedging the queue.
 - Retries never double-count. Every event carries a client-minted id and the ingest ignores
   replays; the presence ping - which is folded into rollups on arrival - is re-sent only when the
-  server provably never saw it, and the on-disk queue never holds a ping that is in flight.
+  server provably never saw it, and the on-disk queue never holds a ping that is in flight. A ping
+  dropped instead of retried stops pacing the next one, so presence is proved again rather than
+  waiting out a second interval.
 - Collection runs in the app's main process only. `Application.onCreate` runs once per process, and
   one install's queue file, session and presence state cannot be shared by two of them, so
   `configure` from a component with `android:process` logs one line and records nothing. Track from

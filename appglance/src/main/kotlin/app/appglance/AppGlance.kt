@@ -13,6 +13,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
@@ -75,26 +76,10 @@ public object AppGlance {
         public val endpoint: String = DEFAULT_ENDPOINT,
         /** Marketing version of the app; defaults to the package's `versionName`. */
         public val appVersion: String? = null,
-        /** How long to wait before sending a partial batch. Must be positive. Default 10 s. */
-        public val flushInterval: Duration = 10.seconds,
-        /** Send at once when this many events are queued. 1 to 500, the ingest API's per-request maximum. Default 20. */
-        public val maxBatchSize: Int = 20,
-        /**
-         * How long the app can be in the foreground with nothing sent before a presence ping goes
-         * out. Pings power "active right now" and session length and are never billable; a real
-         * event proves presence just as well, so a ping is only sent after this long of silence.
-         * At least 15 seconds. Default 60 s. The server may ask for a sparser cadence for the
-         * account's plan; the SDK then uses the larger of the two, so this is a floor you can
-         * raise, not lower. One extra ping goes out when the app leaves the foreground after more
-         * than a minute of silence, so a session's length is exact whatever the cadence.
-         */
-        public val heartbeatInterval: Duration = 60.seconds,
-        /**
-         * How long the app can be away - backgrounded, or killed and relaunched - before coming back
-         * starts a new session (`session.start`). Must be positive. Default 5 minutes, the same gap
-         * the dashboard uses to split an install's events into sessions.
-         */
-        public val sessionTimeout: Duration = 5.minutes,
+        flushInterval: Duration = 10.seconds,
+        maxBatchSize: Int = 20,
+        heartbeatInterval: Duration = 60.seconds,
+        sessionTimeout: Duration = 5.minutes,
         /** Master switch. `false` records and sends nothing (e.g. behind a user setting). Default true. */
         public val isEnabled: Boolean = true,
         /**
@@ -134,21 +119,44 @@ public object AppGlance {
          */
         public val debug: Boolean = false,
     ) {
-        // Values in these ranges could only be mistakes - a zero heartbeat is a tight send loop, a
-        // zero batch size could never send - so they fail here, loudly, where the stack trace
-        // points at the call that passed them, instead of misbehaving quietly in the field.
-        init {
-            require(flushInterval.isPositive()) { "flushInterval must be positive, got $flushInterval" }
-            require(heartbeatInterval >= 15.seconds) {
-                "heartbeatInterval must be at least 15 seconds, got $heartbeatInterval: presence needs no finer " +
-                    "resolution, and anything shorter only spends the user's battery and data"
-            }
-            require(sessionTimeout.isPositive()) { "sessionTimeout must be positive, got $sessionTimeout" }
-            require(maxBatchSize in 1..500) {
-                "maxBatchSize must be between 1 and 500, got $maxBatchSize: the ingest API accepts at most " +
-                    "500 events per request"
-            }
-        }
+        // Every number below reaches arithmetic where an out-of-range value is a spin or a stall
+        // inside somebody else's shipped app, which cannot be hot-fixed: `heartbeatInterval` paces
+        // the presence loop, which only waits while the next ping is still in the future, so zero
+        // or less makes it tick (and rewrite the queue file, and POST) as fast as the CPU allows;
+        // `maxBatchSize` decides when a batch is full, so zero or less makes every single event
+        // its own request; `flushInterval` and `sessionTimeout` become a timer delay and a session
+        // boundary. Out-of-range values are clamped rather than refused: an app that ships a bad
+        // number keeps working, with a cadence it can live with, instead of crashing on the call
+        // that configures its analytics. The Swift SDK clamps the same fields to the same bounds.
+
+        /** How long to wait before sending a partial batch. Clamped to 1 s ... 1 h. Default 10 s. */
+        public val flushInterval: Duration = flushInterval.coerceIn(1.seconds, 1.hours)
+
+        /**
+         * Send at once when this many events are queued. Clamped to 1 ... 500, the ingest API's
+         * per-request maximum. Default 20.
+         */
+        public val maxBatchSize: Int = maxBatchSize.coerceIn(1, 500)
+
+        /**
+         * How long the app can be in the foreground with nothing sent before a presence ping goes
+         * out. Pings power "active right now" and session length and are never billable; a real
+         * event proves presence just as well, so a ping is only sent after this long of silence.
+         * Clamped to 15 s ... 1 h: there is no "off" here, and a tighter cadence than 15 s means
+         * nothing to the dashboard's five-minute presence window. Default 60 s. The server may ask
+         * for a sparser cadence for the account's plan; the SDK then uses the larger of the two, so
+         * this is a floor you can raise, not lower. One extra ping goes out when the app leaves the
+         * foreground after more than a minute of silence, so a session's length is exact whatever
+         * the cadence.
+         */
+        public val heartbeatInterval: Duration = heartbeatInterval.coerceIn(15.seconds, 1.hours)
+
+        /**
+         * How long the app can be away - backgrounded, or killed and relaunched - before coming back
+         * starts a new session (`session.start`). Clamped to 1 s ... 24 h. Default 5 minutes, the
+         * same gap the dashboard uses to split an install's events into sessions.
+         */
+        public val sessionTimeout: Duration = sessionTimeout.coerceIn(1.seconds, 24.hours)
 
         public companion object {
             /** The hosted ingest endpoint. */

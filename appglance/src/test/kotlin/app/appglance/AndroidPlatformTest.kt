@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -41,6 +42,55 @@ class AndroidPlatformTest {
         val again = requireNotNull(AnonymousIdentity.current(relaunch.identity))
         assertEquals(minted.id, again.id)
         assertFalse("a relaunch is not an install", again.isNew)
+    }
+
+    /**
+     * Auto Backup and a device-to-device transfer carry the preferences onto a new handset. Both
+     * are then in use, so each needs its own install id: the id is honoured only where the device
+     * marker stored with it still matches.
+     */
+    @Test
+    fun `an install id that arrived from another device is not reused`() {
+        val firstDevice = AndroidPlatform(app) { "device-a" }
+        val minted = requireNotNull(AnonymousIdentity.current(firstDevice.identity))
+        assertTrue(minted.isNew)
+
+        val secondDevice = AndroidPlatform(app) { "device-b" }   // same prefs, restored elsewhere
+        val restored = requireNotNull(AnonymousIdentity.current(secondDevice.identity))
+        assertNotEquals("two handsets in use are two installs", minted.id, restored.id)
+        assertTrue("and the second one is an install", restored.isNew)
+
+        val relaunch = requireNotNull(AnonymousIdentity.current(AndroidPlatform(app) { "device-b" }.identity))
+        assertEquals("which the second device then keeps", restored.id, relaunch.id)
+        assertFalse(relaunch.isNew)
+    }
+
+    @Test
+    fun `an id stored without a marker adopts this device rather than being renumbered`() {
+        val prefs = app.getSharedPreferences(AndroidPlatform.PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(AndroidPlatform.KEY_INSTALL_ID, "SET-UP-BY-AN-EARLIER-VERSION").commit()
+
+        val identity = requireNotNull(AnonymousIdentity.current(AndroidPlatform(app) { "device-a" }.identity))
+        assertEquals("SET-UP-BY-AN-EARLIER-VERSION", identity.id)
+        assertFalse("an existing install is not a new one", identity.isNew)
+        assertEquals("device-a", prefs.getString(AndroidPlatform.KEY_INSTALL_DEVICE, null))
+    }
+
+    @Test
+    fun `a device that will not identify itself keeps the id it has`() {
+        val minted = requireNotNull(AnonymousIdentity.current(AndroidPlatform(app) { null }.identity))
+        val again = requireNotNull(AnonymousIdentity.current(AndroidPlatform(app) { null }.identity))
+        assertEquals(minted.id, again.id)
+        assertFalse(again.isNew)
+    }
+
+    @Test
+    fun `the device marker is a hash, never the raw value, and is stable`() {
+        val marker = androidDeviceMarker(app)
+        if (marker != null) {
+            assertEquals(marker, androidDeviceMarker(app))
+            assertTrue("a short hex digest", marker.matches(Regex("^[0-9a-f]{16}$")))
+        }
     }
 
     @Test

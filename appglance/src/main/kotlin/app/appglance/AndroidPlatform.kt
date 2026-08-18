@@ -6,13 +6,19 @@ import android.content.pm.ApplicationInfo
 import android.content.res.Resources
 import android.os.Build
 import android.os.UserManager
+import android.provider.Settings
 import android.util.AtomicFile
 import java.io.File
 import java.io.IOException
+import java.security.MessageDigest
 import java.util.Locale
 
 /** The production [Platform]: SharedPreferences, the app's private files, `Build`, `PackageManager`. */
-internal class AndroidPlatform(context: Context) : Platform {
+internal class AndroidPlatform(
+    context: Context,
+    /** Which device this is, for [SharedPreferencesIdentityStore]; a seam for tests. */
+    private val deviceMarker: (Context) -> String? = ::androidDeviceMarker,
+) : Platform {
     private val context: Context = context.applicationContext ?: context
 
     private val sharedPreferences: SharedPreferences by lazy {
@@ -36,6 +42,14 @@ internal class AndroidPlatform(context: Context) : Platform {
      * The install id lives in SharedPreferences - inside Android's Auto Backup set, so a
      * delete-and-reinstall on the same account usually restores it and the person is counted once.
      * A fresh id after a reinstall without a backup counts as a new user, which is acceptable.
+     *
+     * Auto Backup and a device-to-device transfer also carry those preferences onto a NEW handset,
+     * where the same id would then be live on two devices at once and report them as one install.
+     * The id is therefore stored with a marker for the device that minted it (see
+     * [androidDeviceMarker]) and is honoured only where that marker still matches: elsewhere it
+     * reads as absent, and a fresh id is minted for the second device. An id stored without a
+     * marker adopts the current one instead of being renumbered, so an install set up by an
+     * earlier version of the SDK stays the same install.
      */
     private inner class SharedPreferencesIdentityStore : IdentityStore {
         override fun lookup(): IdentityLookup {
@@ -45,7 +59,25 @@ internal class AndroidPlatform(context: Context) : Platform {
             if (!userUnlocked()) return IdentityLookup.Unavailable
             return try {
                 val id = sharedPreferences.getString(KEY_INSTALL_ID, null)
-                if (id.isNullOrEmpty()) IdentityLookup.Absent else IdentityLookup.Found(id)
+                if (id.isNullOrEmpty()) return IdentityLookup.Absent
+                val marker = deviceMarker(context)
+                val minted = sharedPreferences.getString(KEY_INSTALL_DEVICE, null)
+                when {
+                    // Nothing to compare with: the platform will not say which device this is, so
+                    // the id stands rather than every launch minting a new one.
+                    marker == null -> IdentityLookup.Found(id)
+
+                    minted == null -> {
+                        sharedPreferences.edit().putString(KEY_INSTALL_DEVICE, marker).apply()
+                        IdentityLookup.Found(id)
+                    }
+
+                    minted == marker -> IdentityLookup.Found(id)
+
+                    // These preferences were minted on another device and travelled here in a
+                    // backup or a transfer. Both handsets are in use; each needs its own id.
+                    else -> IdentityLookup.Absent
+                }
             } catch (_: IllegalStateException) {
                 IdentityLookup.Unavailable
             }
@@ -54,7 +86,10 @@ internal class AndroidPlatform(context: Context) : Platform {
         override fun save(id: String) {
             // `commit`, not `apply`: this is written once per install and must be on disk before
             // the `install` event that depends on it can possibly be sent.
-            sharedPreferences.edit().putString(KEY_INSTALL_ID, id).commit()
+            val editor = sharedPreferences.edit().putString(KEY_INSTALL_ID, id)
+            val marker = deviceMarker(context)
+            if (marker == null) editor.remove(KEY_INSTALL_DEVICE) else editor.putString(KEY_INSTALL_DEVICE, marker)
+            editor.commit()
         }
 
         private fun userUnlocked(): Boolean {
@@ -114,8 +149,29 @@ internal class AndroidPlatform(context: Context) : Platform {
     companion object {
         const val PREFS_NAME = "app.appglance"
         const val KEY_INSTALL_ID = "installId"
+        const val KEY_INSTALL_DEVICE = "installDevice"
     }
 }
+
+/**
+ * Which device an install id was minted on: `ANDROID_ID`, hashed, kept in the app's own
+ * preferences and never sent anywhere. It is scoped to the app's signing key, the user and the
+ * device, so it survives a reinstall - which is what keeps a returning user one user - and differs
+ * on a new handset, which is what stops one id being live on two of them. Null when the platform
+ * will not answer; the caller then trusts the id it has.
+ */
+internal fun androidDeviceMarker(context: Context): String? = try {
+    val id = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+    if (id.isNullOrBlank()) null else shortHash(id)
+} catch (_: Exception) {
+    null
+}
+
+/** Enough of a SHA-256 to tell two devices apart, so the raw value is never stored or backed up. */
+private fun shortHash(value: String): String =
+    MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+        .take(8)
+        .joinToString("") { "%02x".format(it.toInt() and 0xff) }
 
 /** Minimal, non-identifying device context. */
 internal class AndroidDeviceInfo(private val context: Context) : DeviceInfo {

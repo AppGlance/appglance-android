@@ -8,6 +8,8 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-18
+
 ### Fixed
 
 - Sessions and presence keep working when the host app removes androidx.startup's
@@ -31,6 +33,17 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
   one interval leaves no ping stamp behind and a resumed session records no `session.start`, so the
   fresh process had no proof of presence of its own however recently the server had heard from that
   install. Low-RAM devices relaunch inside a visit routinely.
+- The install id no longer follows a backup onto a second device. It lives in SharedPreferences
+  so that a reinstall on the same account keeps it, but Auto Backup and a device-to-device
+  transfer carry those preferences onto a new handset too, where the same id was adopted and two
+  devices in use reported as one install. The id is now stored with a hashed marker for the
+  device that minted it and is honoured only where that marker still matches; an id stored
+  without one adopts the current device rather than being renumbered, so an install set up by an
+  earlier version stays the same install. The marker is never sent anywhere.
+- A server's `Retry-After` is bounded. It was obeyed as given, so `Retry-After: 86400` parked
+  automatic delivery for a day (an explicit `flush()` and the flush on backgrounding still sent).
+  It is capped at 15 minutes, the same ceiling the Swift SDK applies: past that it is an outage,
+  not rate limiting, and the on-disk queue is the better answer.
 - `configure` outside the app's main process records nothing and logs why. `Application.onCreate`
   runs once per process, so an app with an `android:process` component got a second, fully
   independent client on the same queue file and the same preference keys: two writers of one file,
@@ -39,6 +52,13 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
 
 ### Changed
 
+- Configuration values are clamped instead of refused. `heartbeatInterval = 0.seconds` (a
+  plausible guess for "no presence pings", which is not a thing the SDK offers) and a zero batch
+  size threw out of the `Configuration` constructor, so a number computed at runtime could take
+  the host app down on the call that sets analytics up. `flushInterval` is now clamped to 1 s - 1
+  h, `heartbeatInterval` to 15 s - 1 h, `sessionTimeout` to 1 s - 24 h and `maxBatchSize` to
+  1 - 500, the same bounds the Swift SDK applies: an app that ships a bad number keeps working,
+  with a cadence it can live with.
 - The README's setup section describes the presence ping the SDK actually sends (one after an
   interval of silence, none while real events are flowing, and a sparser cadence when the server
   asks for one), and its Gradle snippet is at the current version.
@@ -49,7 +69,7 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
 
 - The presence ping now measures silence, not time. A real event proves the app is in front of
   someone exactly as a ping does (the server moves the same "last seen" and session stamps for
-  both), so a `heartbeat` is sent only after `heartbeatInterval` with nothing else sent — the tick
+  both), so a `heartbeat` is sent only after `heartbeatInterval` with nothing else sent: the tick
   that used to fire at the start of every session alongside `session.start` is gone, an install
   that keeps sending events never pings, and a quiet one pings once per interval of quiet.
   Nothing on the dashboard changes: "active right now" and session length read the same stamps as
@@ -65,9 +85,9 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
 ### Added
 
 - The server may ask for a sparser presence cadence for the account's plan by answering a batch
-  with `heartbeat_interval` (seconds). The SDK obeys it as a floor — the effective interval is the
+  with `heartbeat_interval` (seconds). The SDK obeys it as a floor (the effective interval is the
   larger of the configured `heartbeatInterval` and the server's value, so an app that configured a
-  longer interval keeps it — remembers it across launches, and ignores values outside 15 s–1 h.
+  longer interval keeps it), remembers it across launches, and ignores values outside 15 s to 1 h.
   Servers that send nothing leave the configured interval in force, so this is fully additive on
   the wire.
 

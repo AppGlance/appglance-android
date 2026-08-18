@@ -642,14 +642,15 @@ internal class Client(
      * Arms the automatic-retry throttle after a retryable failure. The next automatic drain waits
      * `min(60 s, 2^failures seconds)`, jittered into the upper half of that window so clients that
      * failed together do not all retry together, and never less than the server's own numeric
-     * `Retry-After` on a 429. A successful send clears it; [flush] ignores it (see [flushSoon]).
+     * `Retry-After` on a 429, which is itself clamped (see [obeyableRetryAfterMillis]). A
+     * successful send clears it; [flush] ignores it (see [flushSoon]).
      */
     private fun backOff(retryAfterSeconds: Long?) {
         synchronized(queueLock) {
             failureStreak++
             val base = minOf(MAX_BACKOFF_MILLIS, (1L shl minOf(failureStreak, 6)) * 1_000L)
             val jittered = base / 2 + (random() * (base / 2)).toLong()
-            nextAttemptAt = now() + maxOf(jittered, (retryAfterSeconds ?: 0L) * 1_000L)
+            nextAttemptAt = now() + maxOf(jittered, obeyableRetryAfterMillis(retryAfterSeconds))
         }
     }
 
@@ -736,6 +737,18 @@ internal class Client(
 
         /** Ceiling on the automatic-retry backoff window. */
         const val MAX_BACKOFF_MILLIS: Long = 60_000L
+
+        /**
+         * The longest wait the SDK obeys from a `Retry-After`. Past this it is not rate limiting
+         * any more, it is an outage, and the on-disk queue plus the flush on the way to the
+         * background answer that better than a foreground stretch that never sends. A header alone
+         * must not be able to stop an install sending for a day.
+         */
+        const val MAX_RETRY_AFTER_SECONDS: Long = 900L
+
+        /** A server's `Retry-After` as a delay: obeyed only as a positive number of seconds, clamped. */
+        fun obeyableRetryAfterMillis(seconds: Long?): Long =
+            if (seconds == null || seconds <= 0L) 0L else minOf(seconds, MAX_RETRY_AFTER_SECONDS) * 1_000L
 
         /** A background transition sends one last ping if the server has heard nothing for this long. */
         const val CLOSING_TICK_AFTER_MILLIS: Long = 60_000L

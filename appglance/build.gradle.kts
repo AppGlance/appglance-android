@@ -11,7 +11,7 @@ plugins {
 // The one place the SDK version lives: the POM, the AAR and `BuildConfig.VERSION` (the
 // User-Agent the ingest sees) all read it from here.
 group = "app.appglance"
-version = "1.1.0"
+version = "1.2.0"
 
 android {
     namespace = "app.appglance"
