@@ -114,6 +114,16 @@ internal class Client(
     private var installRecorded = false
 
     init {
+        // A minted id means this device is not the one the state below was written on. The install
+        // id is device-bound (it is honoured only where the marker for the device that minted it
+        // still matches), but everything else lives in the same SharedPreferences, which Auto
+        // Backup and a device-to-device transfer both carry - so a restored handset mints its own
+        // id and then reads the old device's session, presence stamps and user properties as its
+        // own. The traits are the lasting half: `identify` only sends a change, so an install
+        // whose cache says the server already has these properties never sends them, and its page
+        // in the dashboard stays empty however often the app calls `identify`. A genuinely new
+        // install has nothing here to clear, so this costs it nothing.
+        if (isNewInstall) forgetPersistedState()
         prefs.getLong(lastActiveKey)?.let {
             lastActiveAt = it
             sessionId = prefs.getString(sessionKey)
@@ -132,8 +142,39 @@ internal class Client(
         serverHeartbeatFloorMillis = prefs.getLong(heartbeatFloorKey)?.takeIf { isSaneHeartbeatFloorMillis(it) }
         premintSessionIdIfNeeded()
         traits = prefs.getString(traitsKey)?.let(::decodeTraits) ?: emptyMap()
-        queueStore.load()?.let { queue.addAll(EventCoding.decode(it)) }
+        // Consent withdrawal applies to what is already on disk, not only to what happens next.
+        // The way an app honours it is to `configure` again with `isEnabled = false`, and the
+        // events recorded before that are exactly the ones consent was withdrawn for: a later
+        // `flush()` must not ship them, and turning the switch back on must not resurrect them.
+        //
+        // The delete is keyed on `isEnabled` alone, NOT on `collecting`. `collecting` also folds
+        // in the environment gate, and that gate closing is not a withdrawal of consent: a
+        // debuggable build run over an installed release copy closes it for that run, and
+        // deleting the file there would throw away a real queue the release build saved during an
+        // outage. A closed environment gate stops the queue being loaded; only a closed consent
+        // switch destroys it.
+        if (collecting) queueStore.load()?.let { queue.addAll(EventCoding.decode(it)) }
+        if (!config.isEnabled) queueStore.delete()
         announce()
+    }
+
+    /**
+     * Drops every persisted trace of an install that is not this one: the session and its pending
+     * id, the presence stamps, the server's cadence floor and the user properties. The queue file
+     * is not among them - it lives outside the backup set and so never arrives on a second device
+     * in the first place.
+     */
+    private fun forgetPersistedState() {
+        val keys = listOf(
+            lastActiveKey,
+            lastHeartbeatKey,
+            lastEventKey,
+            heartbeatFloorKey,
+            sessionKey,
+            pendingSessionKey,
+            traitsKey,
+        )
+        for (key in keys) prefs.remove(key)
     }
 
     /**
@@ -339,6 +380,7 @@ internal class Client(
     fun flush() {
         flushTask?.let(scheduler::cancel)
         flushTask = null
+        if (!collecting || retired) return
         requestDrain()
     }
 
@@ -580,7 +622,7 @@ internal class Client(
         var slice = MAX_EVENTS_PER_REQUEST
         while (true) {
             val batch: List<Event> = synchronized(queueLock) {
-                if (retired || queue.isEmpty()) return
+                if (!collecting || retired || queue.isEmpty()) return
                 val n = minOf(slice, queue.size)
                 List(n) { queue.removeFirst() }.also {
                     inFlightBatch = it

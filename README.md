@@ -129,7 +129,7 @@ AppGlance.configure(this, AppGlance.Configuration(
 | `maxBatchSize` | `20` | Send at once when this many events are queued. Clamped to 1 - 500, the largest batch the ingest API accepts. |
 | `heartbeatInterval` | `60.seconds` | Seconds of silence in the foreground before a presence ping (drives "active now"). A real event resets it; the server may raise it for the account's plan. Never billable. Clamped to 15 s - 1 h: there is no way to switch presence off here. |
 | `sessionTimeout` | `5.minutes` | Away longer than this and coming back is a new session - the dashboard splits on the same gap. Clamped to 1 s - 24 h. |
-| `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. |
+| `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. Turning it off also discards whatever an earlier run left queued on disk, so a consent withdrawal covers events already recorded. |
 | `collectsCountry` | `true` | The device's region *setting* (system locale) as a two-letter code. Not GPS, not IP. |
 | `enabledEnvironments` | `{PRODUCTION, BETA}` | Which environments send; emulator runs and debuggable builds never do by default. |
 | `environment` | `null` (auto) | Android cannot tell a Play testing track from production - pass `AppEnvironment.BETA` in that build (a flavor is the natural place). Emulator and debuggable are always detected. |

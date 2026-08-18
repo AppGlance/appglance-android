@@ -8,6 +8,27 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
 
 ## [Unreleased]
 
+### Fixed
+
+- Turning collection off now discards what was already queued. `isEnabled = false` is how an app
+  honours a consent withdrawal, but the events recorded before the switch was flipped stayed in
+  the on-disk queue: an explicit `flush()` shipped them, and turning the switch back on brought
+  them back. A client that is not collecting drops the persisted queue and deletes the file at
+  startup, and `flush()` and the send loop are gated on the same switch, as every other command
+  already was. A closed environment gate is not a withdrawal of consent and still leaves the file
+  alone: it stops the queue being loaded, and the build that owns it keeps what it saved during an
+  outage. The Swift SDK has held this line since 1.2.0.
+- A restored device no longer inherits the install it was restored from. The install id is
+  device-bound - it is honoured only where the marker for the device that minted it still
+  matches - so a second handset correctly mints its own; the session, the presence stamps and the
+  user properties beside it live in the same SharedPreferences, which Auto Backup and a
+  device-to-device transfer both carry. The new install read that state as its own. It continued
+  the old device's session when the app was opened within `sessionTimeout` of that device's last
+  use, so its first visit recorded no `session.start`; and, with no time limit at all, it began
+  believing the server already held the old device's user properties, so `identify` with those
+  values sent nothing and the install's page in the dashboard stayed empty however often the app
+  called it. State left by an install that is not this one is now dropped when an id is minted.
+
 ## [1.2.0] - 2026-08-18
 
 ### Fixed

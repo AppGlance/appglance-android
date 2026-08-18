@@ -39,6 +39,9 @@ internal interface KeyValueStore {
 internal interface QueueStore {
     fun load(): String?
     fun save(json: String)
+
+    /** Removes the file entirely, for a consent withdrawal. */
+    fun delete()
 }
 
 /** Minimal, non-identifying device context attached to every event. */

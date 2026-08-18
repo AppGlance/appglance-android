@@ -176,6 +176,10 @@ internal class InMemoryQueueStore : QueueStore {
         this.json = json
         writes++
     }
+
+    override fun delete() {
+        json = null
+    }
 }
 
 internal class FakeDeviceInfo(

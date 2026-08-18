@@ -37,6 +37,52 @@ class IdentityTest {
     }
 
     /**
+     * The id is device-bound - it is honoured only where the marker for the device that minted it
+     * still matches - but the session, the presence stamps and the user properties beside it are
+     * in the same SharedPreferences, which Auto Backup and a device-to-device transfer both carry.
+     * The restored handset correctly mints its own id; it must not then read the old device's
+     * state as its own, or it opens no session of its own and never sends the properties its
+     * install page is waiting for.
+     */
+    @Test
+    fun `a new install id does not inherit the state a transfer carried over`() {
+        val platform = InMemoryPlatform()
+        val clock = FakeClock()
+        val scheduler = FakeScheduler(clock)
+
+        val a = makeClient(platform, clock, scheduler, RecordingTransport(), userId = "install-A")
+        a.setActive(true)
+        a.identify(mapOf("\$email" to "ada@example.com"))
+        a.flush()
+        val sessionA = a.currentSessionId()
+        a.shutdown()
+
+        // The queue file is not part of this: it lives in noBackupFilesDir, so it never arrives on
+        // the second device. The preferences beside it do. The transfer lands and the app is
+        // opened a minute later - inside the session timeout, so the old device's session would
+        // still look resumable.
+        clock.advance(60_000)
+        val transport = RecordingTransport()
+        val b = makeClient(platform, clock, scheduler, transport, userId = "install-B", isNewInstall = true)
+        b.recordInstallIfNeeded()
+        assertEquals(
+            "the new install starts with no properties of its own",
+            emptyMap<String, String>(),
+            b.currentTraits(),
+        )
+        assertNotEquals("and does not continue the old device's session", sessionA, b.currentSessionId())
+
+        b.setActive(true)
+        b.identify(mapOf("\$email" to "ada@example.com"))
+        b.flush()
+        assertEquals(
+            "so its first visit is a session of its own, and its properties reach the server",
+            listOf(Signal.INSTALL, Signal.SESSION_START, Signal.IDENTIFY),
+            transport.signals(),
+        )
+    }
+
+    /**
      * Credential-encrypted storage is unreadable before the user's first unlock (Direct Boot) -
      * exactly when a background launch can happen. Minting there would create a phantom second
      * user; the SDK must wait instead.

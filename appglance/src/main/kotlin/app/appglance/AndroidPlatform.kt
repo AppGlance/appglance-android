@@ -144,6 +144,10 @@ internal class AndroidPlatform(
                 atomic.failWrite(out)
             }
         }
+
+        override fun delete() {
+            atomic.delete()
+        }
     }
 
     companion object {

@@ -2,6 +2,8 @@ package app.appglance
 
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -110,6 +112,66 @@ class EnvironmentGateTest {
         )
         beta.track("x", null)
         assertEquals("beta", beta.pendingEvents().single().environment)
+    }
+
+    /**
+     * `isEnabled = false` is how an app honours a consent withdrawal, and it has to apply to what
+     * is already on disk: the events recorded before the switch was flipped are exactly the ones
+     * consent was withdrawn for. The Swift SDK holds the same line.
+     */
+    @Test
+    fun `turning collection off discards what was already queued`() {
+        val platform = InMemoryPlatform()
+        val clock = FakeClock()
+        val scheduler = FakeScheduler(clock)
+        val transport = RecordingTransport()
+
+        val collecting = makeClient(platform, clock, scheduler, transport, testConfiguration())
+        collecting.track("before.the.switch", null)
+        collecting.identify(mapOf("\$email" to "ada@example.com"))
+        val onDisk = EventCoding.decode(requireNotNull(platform.queues.values.single().json))
+        assertEquals("both are on disk", 2, onDisk.size)
+        collecting.shutdown()
+
+        // The app calls configure again with the switch off; the replacement client owns the file.
+        val off = makeClient(platform, clock, scheduler, transport, testConfiguration(isEnabled = false))
+        assertEquals("the backlog is not inherited", emptyList<String>(), off.pendingSignals())
+        assertNull(
+            "nor left on disk to be resurrected by turning the switch back on",
+            platform.queues.values.single().json,
+        )
+
+        off.flush()
+        assertEquals("an explicit flush after withdrawal sends nothing", emptyList<String>(), transport.signals())
+
+        val backOn = makeClient(platform, clock, scheduler, transport, testConfiguration())
+        backOn.flush()
+        assertEquals("and turning it back on resurrects nothing", emptyList<String>(), transport.signals())
+    }
+
+    /**
+     * A closed environment gate is not a withdrawal of consent: a debuggable build run over an
+     * installed release copy closes it for that run, and destroying the file there would throw
+     * away a real queue the release build saved during an outage. It is not loaded, and it is
+     * still there for the build that owns it.
+     */
+    @Test
+    fun `a closed environment gate leaves the queue on disk`() {
+        val platform = InMemoryPlatform()
+        val clock = FakeClock()
+        val scheduler = FakeScheduler(clock)
+
+        val sending = makeClient(platform, clock, scheduler, RecordingTransport(), testConfiguration())
+        sending.track("from.the.release.build", null)
+        sending.shutdown()
+
+        val gatedConfig = testConfiguration(enabledEnvironments = emptySet())
+        val gated = makeClient(platform, clock, scheduler, RecordingTransport(), gatedConfig)
+        assertEquals("a gated client loads nothing", emptyList<String>(), gated.pendingSignals())
+        assertNotNull(
+            "but the queue is still owed to the build that recorded it",
+            platform.queues.values.single().json,
+        )
     }
 
     @Test
