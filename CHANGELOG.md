@@ -6,7 +6,7 @@ All notable changes to the AppGlance Android SDK (`app.appglance:appglance`). Th
 [GitHub Release](https://github.com/AppGlance/appglance-android/releases) with the same notes.
 The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-apple/blob/main/CHANGELOG.md).
 
-## [Unreleased]
+## [1.2.0] - 2026-08-19
 
 ### Fixed
 
@@ -28,11 +28,100 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
   believing the server already held the old device's user properties, so `identify` with those
   values sent nothing and the install's page in the dashboard stayed empty however often the app
   called it. State left by an install that is not this one is now dropped when an id is minted.
-
-## [1.2.0] - 2026-08-18
-
-### Fixed
-
+- A first launch that cannot send no longer costs the install its `install` event. The id is
+  minted and stored before anything knows whether this build collects, and a launch behind a
+  closed environment gate (the default excludes debuggable builds and emulators) or with
+  `isEnabled = false` while the app waits for consent records nothing. Every later launch found
+  the stored id, so the one launch that could have recorded the event was already over and the
+  install never appeared at all. A launch that mints the id and cannot record now notes the debt,
+  and the first launch that is collecting records `install`, stamped with its own `configure`.
+  The Swift SDK holds the same line.
+- The user-properties snapshot records what the server acknowledged, not what was queued.
+  `identify` committed the merged set the moment it queued the `user.identify` carrying it, and
+  only a change is ever sent, so any event lost after that froze the install's properties for
+  good: the 500-event cap trimming the oldest, a permanent `4xx` dropping the slice, or the ingest
+  answering `202` while storing nothing (past the plan's grace ceiling, or under the per-install
+  rate limiter). The install's page in the dashboard then stayed blank however often the app
+  called `identify` with the same values, which the documentation tells it to do at every launch.
+  The snapshot now moves only when a batch carrying that event comes back accepted and counted
+  whole; what an event still owed will leave behind is read from the queue itself, so an
+  `identify` made while an earlier one is in flight merges on top of it instead of re-sending it,
+  and a repeat of values the server really has is still free.
+- Withdrawing consent now clears the user properties as well as the queue. `isEnabled = false`
+  discarded the queued events, but `$email`, `$name` and `$id` stayed in SharedPreferences, inside
+  Auto Backup, and `reset()` - the only other thing that clears them - records nothing on a client
+  that is not collecting. So the natural order of honouring a withdrawal, turn collection off and
+  then forget the person, left them on disk indefinitely. They are deleted with the queue now,
+  keyed on `isEnabled` alone: a closed environment gate is not a withdrawal and still leaves both
+  alone. The install id is untouched, so turning collection back on is the same install rather
+  than a new one.
+- A presence stamp the clock has not reached yet no longer silences the heartbeat. The last-ping,
+  last-event and last-active stamps were restored from disk without a sanity check, unlike the
+  server's cadence floor beside them, so a device whose clock was hours ahead when they were
+  written measured a negative silence after the correction and never owed a ping again, on that
+  launch and on every launch after it. Presence is now measured from a stamp only while that stamp
+  can be true, the wait between pings is never longer than one interval whatever the arithmetic
+  says, and a stamp from the future is neither restored nor rolled back to. A visit that records
+  nothing at all now ends with the closing ping the Swift SDK already sent, so both SDKs report
+  the same session length for the same visit.
+- A second `configure` while the app is in the foreground no longer leaves the replacement client
+  inactive for the rest of the visit when the app drives `setActive` itself. The lifecycle bridge
+  hands the replacement the foreground state it can see, but `trackAppLifecycle = false` detaches
+  it, and the app's own `onStart` fired long before the consent switch was touched - so a client
+  built on the settings screen recorded no `session.start`, sent no presence ping and did not
+  flush on the way to the background. The last foreground state anybody reported now travels with
+  the swap, whichever side reported it.
+- A session id pre-minted by a process that died before its first foreground is adopted by the
+  next launch whatever the gap since the last activity looks like. The gap was measured first and
+  won, so a clock corrected backwards between the two processes left that id unadopted and the
+  events already queued under it in a session the server was never told about. The Swift SDK has
+  always read the unadopted id first.
+- A batch rejected for good no longer costs the install a whole interval of presence. A permanent
+  `4xx` drops the slice rather than putting it back, and the ingest rejects a batch like that
+  before it reads a row, so any presence pings in it were provably never counted - but their stamp
+  was left in place, so the next ping was not due for a full interval. At the four-minute cadence a
+  free-plan account is asked for, two of those back to back are longer than the dashboard's
+  five-minute presence window, so an install that never left the foreground dropped out of "active
+  right now" for about three minutes and its session was cut short. The stamp is now rolled back to
+  the last ping the server acknowledged, which is what the retryable path has done since 1.2.0.
+- An automatic flush no longer retries inside the backoff it should be obeying. The flush timer
+  read the backoff on the command thread and then asked the send loop to drain, so a timer that
+  fired while a request was still on the wire saw no backoff at all: the drain it queued waited
+  behind that request and then ran the instant it failed, going straight at a server that had just
+  asked for room. One outage counted as two consecutive failures, so the streak, and the window it
+  sets, doubled every cycle. The backoff is now read where the send actually starts, and a drain
+  that finds a window in force re-arms the flush timer instead of sending. An explicit `flush()`
+  still always attempts.
+- `install` is no longer stamped later than the calls that were made before `configure`. Calls made
+  before the SDK is configured are held and replayed, and each keeps the moment the app made it,
+  while `install` was stamped with `configure` - so an app that tracks from a `ContentProvider` or
+  a library initializer, both of which run before `Application.onCreate`, sent an `install` dated
+  after an event that provably preceded it, and the platform's first-seen rollup takes the smallest
+  timestamp an install ever sends. `install` now carries the earliest moment the SDK holds for that
+  install, which is `configure` unless calls made before it are still waiting.
+- User-property keys and values are no longer cut through the middle of a surrogate pair. The cut
+  is made in UTF-16 code units, which is the unit the ingest counts in, so the two agree on where
+  it falls - except when it falls between the two halves of a character outside the basic plane, an
+  emoji or a flag. What was left ended in a lone high surrogate, which UTF-8 encoding turns into
+  `?` on the way out and which the ingest strips on the way in, so the server could only store
+  something the SDK did not have; and because only a change is ever sent, no later `identify` with
+  the same values could correct it. The orphaned half is dropped now, which is what the ingest and
+  the Swift SDK both do with it.
+- A minted install id that the store did not keep is no longer reported as a new install. The id
+  was claimed as new without asking whether the write landed, and a device that cannot write - a
+  full data partition - then minted a different id on every launch and recorded an `install` for
+  each, so one device arrived as an unbounded stream of users that nothing on the server could
+  collapse: every one of them carries a different id. The store now reports whether the id reached
+  disk, which is the one thing `SharedPreferences.commit` can say and the in-memory value cannot,
+  and the id is read back before it is claimed. A run whose id nothing kept uses it for this
+  launch's events and records no install, the same trade the unreadable-store case already made.
+- A second session opened inside one process now writes its id down before the event that carries
+  it. `track` persists the queue as it records, and the `session.start` was queued, and written,
+  ahead of the id reaching preferences - so a process killed in that window, a force-quit as the
+  app is coming back, left a start for a session nothing on disk named, and the next launch inside
+  the timeout resumed the id before it and filed the whole visit under a session whose start was
+  never sent. The pre-minted id was already written in this order; the in-process mint was the one
+  that was not.
 - Sessions and presence keep working when the host app removes androidx.startup's
   `InitializationProvider` from its manifest, a documented cold-start trim. `ProcessLifecycleOwner`
   reports nothing without it, so the SDK saw no foreground transition at all: no `session.start`, no
@@ -71,8 +160,50 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
   each rewriting it from its own in-memory queue, and on a first launch two install ids and two
   `install` events for one device.
 
+### Added
+
+- `AppGlance.Configuration.Builder`, so a Java-only app can configure the SDK at all. Kotlin
+  default arguments and `kotlin.time.Duration` are both invisible from Java, so a `Configuration`
+  could be built only from Kotlin: a Java app could pass the write key and `debug` to `configure`
+  and reach nothing else - not `isEnabled`, not `enabledEnvironments`, not the intervals. The
+  builder takes whole seconds for the three intervals, goes through the same constructor and so
+  the same clamps, and is compiled against from Java in the test suite, so the surface cannot
+  quietly go away again. It adds about 3 KB to the AAR.
+
 ### Changed
 
+- A burst of events leaves the device as one delivery rather than one request per event. The send
+  loop is fed by the same queue the app is writing to, so an app recording as fast as the network
+  answers - a screenful of items, a replayed queue of user actions - had every round after the
+  first find exactly the one event tracked during the last round trip and send it on its own: a
+  full set of request headers and a round trip each. A delivery now sends what was owed when it
+  began, and the batch-size trigger asks for one delivery at a time rather than one for every
+  event past the threshold. Anything tracked after a delivery begins goes with the next one, which
+  the delivery arms before it returns. The Swift SDK bounds its drain the same way.
+- A retryable failure arms its own retry. Asking for a delivery cancels the flush timer on the way
+  in, and the batch-size trigger asks for one delivery at a time, so the batch a failure handed
+  back, and any slice the delivery's bound did not reach, had no trigger left of its own: an app
+  that went quiet after a burst sat on a full queue until something else happened to it, which on
+  a device put down for the night is the next launch. The timer is armed for the window the
+  backoff chose before the delivery returns.
+- The offline queue file is no longer rewritten by a delivery that cannot change what is owed.
+  Claiming a slice with no presence ping in it, and handing that same slice back after a
+  transient failure, both leave the file saying exactly what it already said, and each used to
+  pay a full atomic rewrite, which costs about as much for four hundred bytes as for two hundred
+  kilobytes. What is written, and the moment at which a tracked event becomes durable, are
+  unchanged: the record the client skips against is the bytes a write reported landing, so a
+  store that refuses one repairs the file on the next write rather than skipping it. The Swift
+  SDK makes the same change.
+- Publishing a release is now gated on CI: the release workflow runs the lint, build and test job
+  first and publishes only when it passes, as the Swift SDK has done since 1.0.1. A version tag
+  runs that job exactly once, through the release workflow.
+- The `Signal.HEARTBEAT` documentation describes the presence ping the SDK actually sends: one
+  after `heartbeatInterval` of silence in the foreground, and none while real events are flowing.
+  It still promised a ping every interval, which the SDK stopped sending in 1.1.0. The README's
+  setup section was corrected in 1.2.0; this is the doc comment beside it.
+- The README no longer promises that a `Retry-After` is honoured on any retryable answer: the SDK
+  reads it on a `429`, and backs off on its own schedule otherwise. The Swift SDK reads the header
+  on any answered status, so the two differ here until this one is widened to match.
 - Configuration values are clamped instead of refused. `heartbeatInterval = 0.seconds` (a
   plausible guess for "no presence pings", which is not a thing the SDK offers) and a zero batch
   size threw out of the `Configuration` constructor, so a number computed at runtime could take
