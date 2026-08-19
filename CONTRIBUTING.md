@@ -33,9 +33,12 @@ agree on the shape.
 
    If it moves past the quoted figure, update the README (and tell whoever maintains the site).
 3. `git tag x.y.z && git push origin main x.y.z`.
-4. The Release workflow publishes a GitHub Release with that changelog section as its notes.
+4. The Release workflow runs CI (lint, build, tests) and, only if it passes, publishes a GitHub
+   Release with that changelog section as its notes.
 5. `./gradlew :appglance:publishAndReleaseToMavenCentral` from a machine with the Central Portal
-   credentials and the signing key (see below).
+   credentials and the signing key (see below). This step is deliberately by hand, so the artifact
+   apps actually resolve is not covered by the gate in step 4: run the suite locally from the
+   tagged commit before you publish.
 
 `./gradlew :appglance:publishToMavenLocal` publishes to `~/.m2` for local use (no signing key
 needed). Maven Central publishing is wired through `com.vanniktech.maven.publish` - javadoc and

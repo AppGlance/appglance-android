@@ -26,7 +26,7 @@ is all it needs. The `INTERNET` permission comes with the library's manifest.
 | Kotlin / JDK for building | 2.x / 17 |
 | Dependencies | `androidx.lifecycle:lifecycle-process` (2.8) |
 
-The release AAR is under 100 KB (about 600 DEX method references) and pulls in nothing an
+The release AAR is about 100 KB (some 600 DEX method references) and pulls in nothing an
 AndroidX app does not already have.
 
 ## Set up
@@ -123,13 +123,23 @@ AppGlance.configure(this, AppGlance.Configuration(
 ))
 ```
 
+From Java, where Kotlin's default arguments and `Duration` are both out of reach, the same
+knobs are on `AppGlance.Configuration.Builder`; the intervals are whole seconds:
+
+```java
+AppGlance.configure(this, new AppGlance.Configuration.Builder("glance_live_…")
+    .enabledEnvironments(EnumSet.of(AppEnvironment.PRODUCTION))
+    .heartbeatIntervalSeconds(120)
+    .build());
+```
+
 | Option | Default | Notes |
 |---|---|---|
 | `flushInterval` | `10.seconds` | Wait before sending a partial batch. Clamped to 1 s - 1 h. |
 | `maxBatchSize` | `20` | Send at once when this many events are queued. Clamped to 1 - 500, the largest batch the ingest API accepts. |
 | `heartbeatInterval` | `60.seconds` | Seconds of silence in the foreground before a presence ping (drives "active now"). A real event resets it; the server may raise it for the account's plan. Never billable. Clamped to 15 s - 1 h: there is no way to switch presence off here. |
 | `sessionTimeout` | `5.minutes` | Away longer than this and coming back is a new session - the dashboard splits on the same gap. Clamped to 1 s - 24 h. |
-| `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. Turning it off also discards whatever an earlier run left queued on disk, so a consent withdrawal covers events already recorded. |
+| `isEnabled` | `true` | Master off-switch (e.g. behind a user setting). Wins over everything, including `debug`. Turning it off also discards whatever an earlier run left queued on disk and the user properties `identify` stored, so a consent withdrawal covers what was already recorded, not just what comes next. |
 | `collectsCountry` | `true` | The device's region *setting* (system locale) as a two-letter code. Not GPS, not IP. |
 | `enabledEnvironments` | `{PRODUCTION, BETA}` | Which environments send; emulator runs and debuggable builds never do by default. |
 | `environment` | `null` (auto) | Android cannot tell a Play testing track from production - pass `AppEnvironment.BETA` in that build (a flavor is the natural place). Emulator and debuggable are always detected. |
@@ -154,7 +164,7 @@ dashboard exactly like an App Store build.
 - Events are persisted to `noBackupFilesDir` as they are tracked, so a crash loses nothing. The
   queue is capped at 500 (oldest dropped), sent oldest-first in slices of 100, one send at a
   time. `429`, `5xx` and offline keep the batch for later, with exponential backoff between
-  automatic retries (a numeric `Retry-After` is honored, up to fifteen minutes); `413` halves it;
+  automatic retries (a numeric `Retry-After` on a `429` is honored, up to fifteen minutes); `413` halves it;
   any other `4xx` (a wrong key, say) drops that slice rather than wedging the queue.
 - Retries never double-count. Every event carries a client-minted id and the ingest ignores
   replays; the presence ping - which is folded into rollups on arrival - is re-sent only when the
