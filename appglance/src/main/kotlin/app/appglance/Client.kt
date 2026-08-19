@@ -189,7 +189,17 @@ internal class Client(
         // deleting the file there would throw away a real queue the release build saved during an
         // outage. A closed environment gate stops the queue being loaded; only a closed consent
         // switch destroys it.
-        if (collecting) queueStore.load()?.let { queue.addAll(EventCoding.decode(it)) }
+        // Trimmed on the way in, not left to the next `track`. The file holds what is OWED,
+        // which is the queue plus the non-ping half of the slice that was on the wire, so it can
+        // carry MAX_EVENTS_PER_REQUEST more than the queue's own cap. Restoring it whole started
+        // the launch over that cap and kept it there until something else was tracked, which is
+        // how a documented 500-event ceiling became 600 on the launch after a crash.
+        if (collecting) {
+            queueStore.load()?.let {
+                queue.addAll(EventCoding.decode(it))
+                trimLocked()
+            }
+        }
         if (!config.isEnabled) {
             queueStore.delete()
             // The person goes with the events. `$email`, `$name` and `$id` are the only personal

@@ -779,6 +779,32 @@ class SessionTest {
     }
 
     /**
+     * The queue file holds what is OWED, which is the queue plus the non-ping half of the slice
+     * that was on the wire, so it can legitimately carry a whole request more than the queue's own
+     * cap. Restoring it whole started the next launch over that cap and left it there until
+     * something else was tracked, so the documented 500-event ceiling was really 600 on exactly
+     * the launch that follows a crash mid-delivery.
+     */
+    @Test
+    fun `a queue file holding more than the cap is trimmed on the way in`() {
+        val rig = Rig()
+        val first = rig.launch()
+        repeat(300) { first.track("e$it", null) }
+        val stored = EventCoding.decode(rig.store.json!!)
+        assertEquals("nothing is trimmed under the cap", 300, stored.size)
+
+        // A file carrying 600 owed events: the shape a kill mid-delivery leaves behind.
+        rig.store.json = EventCoding.encode(stored + stored)
+        assertEquals(600, EventCoding.decode(rig.store.json!!).size)
+
+        assertEquals(
+            "the launch starts at the cap, not over it",
+            Client.MAX_QUEUED_EVENTS,
+            rig.launch().pendingSignals().size,
+        )
+    }
+
+    /**
      * The elision remembers what LANDED, not what was offered. A store that refuses a write and
      * says so must not leave the client believing the file holds those bytes, because the write
      * that follows is very often the identical one: claiming a slice and putting it back both
