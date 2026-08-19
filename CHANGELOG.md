@@ -6,6 +6,27 @@ All notable changes to the AppGlance Android SDK (`app.appglance:appglance`). Th
 [GitHub Release](https://github.com/AppGlance/appglance-android/releases) with the same notes.
 The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-apple/blob/main/CHANGELOG.md).
 
+## [Unreleased]
+
+### Fixed
+
+- A dropped presence ping's replacement keeps its distance when the visit ends in between. The
+  15 second floor between a dropped ping and the ping that replaces it was enforced only by the
+  running presence timer, and the timer runs only while the app is in front: a ping dropped by
+  the flush on the way to the background left nothing behind but the rolled-back stamp, so coming
+  back seconds later ticked at once, and a kill and relaunch inside the interval did the same
+  with no live state at all. If the dropped ping had in fact been counted - the ambiguity that
+  makes dropping the safe choice - the two ticks landed seconds apart in rollups the server folds
+  additively and never dedupes. The floor now lives in the stamp itself, which survives both: the
+  replacement is due 15 seconds after the ping it replaces, however the visit ends. The Swift SDK
+  makes the same change.
+- A cadence floor that lands after the client is retired is no longer adopted. A second
+  `configure` retires the client, but a request already on the wire cannot be recalled, and its
+  answer can carry the server's `heartbeat_interval` - which was written to a preference key the
+  replacement client had already read at its own init. Every other answer that can land after
+  shutdown was already refused; this one now is too. The Swift SDK closes the same gap, along
+  with its user-properties twin, which this SDK already guarded.
+
 ## [1.2.1] - 2026-08-19
 
 ### Changed

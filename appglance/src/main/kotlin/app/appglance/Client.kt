@@ -642,7 +642,8 @@ internal class Client(
 
     /**
      * Undoes the stamp of a ping that [requeue] has just dropped, putting it back to the newest
-     * ping the server acknowledged.
+     * ping the server acknowledged - floored so the replacement stays [MIN_HEARTBEAT_RETRY_MILLIS]
+     * away from the ping it replaces.
      *
      * The stamp is written when a ping is *queued*, because it is what paces the timer and a ping
      * still on the wire must not earn a second one. But a dropped ping is one the server may never
@@ -667,13 +668,23 @@ internal class Client(
      * thread that owns them, and only while the batch's own stamp is still the current one.
      */
     private fun rollBackHeartbeatStamp(newestDropped: Long) {
-        val restored = deliveredHeartbeatAt
+        val acknowledged = deliveredHeartbeatAt
         scheduler.post {
             if (retired) return@post
             val current = lastHeartbeatAt ?: return@post
             if (current > newestDropped) return@post   // a later ping was stamped meanwhile; it paces us now
+            // The floor lives in the stamp, not only in the timer the re-arm below restarts. The
+            // re-arm happens only while the app is in front, and the visit can end, or the
+            // process die, between the drop and the replacement - a background bounce, or a kill
+            // and a relaunch - and either would otherwise tick the moment the app came back,
+            // seconds after the ping it replaces. The stamp is the one record that survives both,
+            // so it is rolled back to the acknowledged ping but never so far that the next tick
+            // lands inside the floor: the next ping is due at
+            // `max(acknowledged + interval, dropped + MIN_HEARTBEAT_RETRY_MILLIS)`.
+            val floor = newestDropped + MIN_HEARTBEAT_RETRY_MILLIS - heartbeatIntervalMillis()
+            val restored = maxOf(acknowledged ?: Long.MIN_VALUE, floor)
             lastHeartbeatAt = restored
-            if (restored == null) prefs.remove(lastHeartbeatKey) else prefs.putLong(lastHeartbeatKey, restored)
+            prefs.putLong(lastHeartbeatKey, restored)
             if (isActive) {
                 stopHeartbeat()
                 scheduleHeartbeat(maxOf(millisUntilNextHeartbeat(), MIN_HEARTBEAT_RETRY_MILLIS))
@@ -688,8 +699,13 @@ internal class Client(
      * values are ignored rather than obeyed: 15 s is the tightest cadence that has any meaning to
      * the dashboard's 5-minute presence window, and past an hour a "presence" ping is not one.
      * Called from the send loop; the timer picks the new value up the next time it looks.
+     *
+     * A retired client adopts nothing, like every other answer that can land after [shutdown]:
+     * a request already on the wire cannot be recalled, and the floor key is the install's,
+     * read by the replacement client at its own init.
      */
     private fun adoptHeartbeatFloor(seconds: Long?) {
+        if (retired) return
         val millis = (seconds ?: return) * 1_000L
         if (!isSaneHeartbeatFloorMillis(millis) || millis == serverHeartbeatFloorMillis) return
         serverHeartbeatFloorMillis = millis

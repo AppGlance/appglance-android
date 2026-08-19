@@ -1336,6 +1336,83 @@ class SessionTest {
     }
 
     /**
+     * The 15 s replacement floor lives in the stamp, so it survives the visit ending. The re-arm
+     * that enforces it runs only while the app is in front, and a ping dropped by the flush on
+     * the way to the background used to leave nothing behind but the rolled-back stamp: coming
+     * back seconds later ticked at once, a second ping within seconds of one the server may well
+     * have counted, and a relaunch inside the interval did the same with no live state at all.
+     */
+    @Test
+    fun `a dropped ping's replacement floor survives a background bounce`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        val start = rig.clock.now
+        val client = rig.launch()
+        client.setActive(true)                       // session.start proves presence at t0
+        client.flush()                               // and is acknowledged, so only the ping is ever owed
+        rig.scheduler.advance(60.seconds)            // quiet for an interval: the loop ticks at t60
+        assertEquals(listOf(Signal.SESSION_START), rig.transport.signals())
+        assertEquals(listOf(Signal.HEARTBEAT), client.pendingSignals())
+
+        rig.transport.script(500)
+        rig.clock.advance(1.seconds)
+        client.setActive(false)                      // quiet for 1 s: no closing tick, and the flush fails
+        rig.scheduler.settle()                       // the roll-back hops home to the command thread
+        assertEquals(
+            "rolled back to fifteen seconds after the dropped ping, not erased",
+            start + 15_000L,
+            rig.platform.prefs.getLong("lastHeartbeat.$appId"),
+        )
+
+        rig.clock.advance(4.seconds)
+        client.setActive(true)                       // back five seconds after the dropped ping
+        assertEquals(
+            "the replacement is due 15 s after the ping it replaces, not the moment the app is back",
+            10_000L,
+            client.millisUntilNextHeartbeat(),
+        )
+        rig.scheduler.advance(9.seconds)
+        assertEquals(0, client.pendingSignals().count { it == Signal.HEARTBEAT })
+        rig.scheduler.advance(1.seconds)
+        assertEquals(1, client.pendingSignals().count { it == Signal.HEARTBEAT })
+    }
+
+    /**
+     * The same late answer can also carry the server's cadence floor, and the floor key is the
+     * install's: the replacement client read it at its own init and owns it from then on. A
+     * retired client adopting the floor would write preferences on behalf of a client that was
+     * told to record nothing further.
+     */
+    @Test
+    fun `a cadence floor that lands after the client is retired is not adopted`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val old = rig.launch(executor = executor)
+            old.track("before", null)
+            val arrived = CountDownLatch(1)
+            val gate = CountDownLatch(1)
+            rig.transport.arrived = arrived
+            rig.transport.gate = gate
+            old.flush()                              // claims the batch, blocks in send
+            assertTrue(arrived.await(5, TimeUnit.SECONDS))
+
+            old.shutdown()                           // a second configure replaces it mid-send
+            rig.transport.heartbeatIntervalSeconds = 240
+            gate.countDown()                         // the 2xx lands, floor and all
+            executor.submit {}.get(5, TimeUnit.SECONDS)
+
+            assertNull(
+                "the floor key is the replacement's to move",
+                rig.platform.prefs.getLong("heartbeatFloor.$appId"),
+            )
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    /**
      * The closing ping is a ping like any other, so the stamp moves with it. Left unstamped it is
      * invisible to everything that paces the loop: the user comes back a few seconds later,
      * `startHeartbeat` reads a stamp from before the visit ended and fires again at once - two
@@ -1423,13 +1500,16 @@ class SessionTest {
      * A stamp at or before the epoch is not one a running device wrote; it is what a handset whose
      * RTC was never set leaves behind. In the arithmetic it is harmless - an enormous elapsed time
      * answers every question the way an absent stamp does - but it also seeds the acknowledged-ping
-     * stamp with a number instead of nothing, and a rollback then writes that nonsense back to disk
-     * for every launch after this one, instead of removing the key.
+     * stamp with a number instead of nothing, and a rollback would then write that nonsense back to
+     * disk for every launch after this one. Discarded at init, the rollback has no acknowledged
+     * ping at all, so it writes the replacement floor paced from the dropped ping itself: a real
+     * moment this device's running clock produced, never the number from the unset one.
      */
     @Test
     fun `a stamp at the epoch is discarded rather than carried forward`() {
         val rig = Rig()
         val appId = rig.config.appId!!
+        val start = rig.clock.now
         rig.platform.prefs.putLong("lastHeartbeat.$appId", 0L)
 
         val client = rig.launch()
@@ -1438,9 +1518,10 @@ class SessionTest {
         rig.transport.script(503)
         client.flush()                               // the server answered, so the ping is dropped
 
-        assertNull(
-            "nothing was ever acknowledged, so the key goes: a number from an unset clock must not " +
-                "outlive the launch that read it",
+        assertEquals(
+            "no acknowledged ping to go back to, so the floor stands: fifteen seconds after the " +
+                "dropped ping, never the number from the unset clock",
+            start + 15_000L,
             rig.platform.prefs.getLong("lastHeartbeat.$appId"),
         )
     }
