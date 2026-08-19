@@ -164,7 +164,7 @@ dashboard exactly like an App Store build.
 - Events are persisted to `noBackupFilesDir` as they are tracked, so a crash loses nothing. The
   queue is capped at 500 (oldest dropped), sent oldest-first in slices of 100, one send at a
   time. `429`, `5xx` and offline keep the batch for later, with exponential backoff between
-  automatic retries (a numeric `Retry-After` on a `429` is honored, up to fifteen minutes); `413` halves it;
+  automatic retries (a numeric `Retry-After` on any answered status is honored, up to fifteen minutes); `413` halves it;
   any other `4xx` (a wrong key, say) drops that slice rather than wedging the queue.
 - Retries never double-count. Every event carries a client-minted id and the ingest ignores
   replays; the presence ping - which is folded into rollups on arrival - is re-sent only when the

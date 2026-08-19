@@ -8,7 +8,8 @@ import kotlin.time.Duration.Companion.seconds
 
 /**
  * Automatic delivery retries back off exponentially after a transient failure - jittered, capped
- * at 60 seconds, floored by a numeric Retry-After on a 429 - and the first success resets it.
+ * at 60 seconds and at five minutes once the streak passes ten, floored by a numeric Retry-After
+ * from any answered status and not from a 429 alone - and the first success resets it.
  * Only automatic triggers wait; an explicit [Client.flush] is the developer saying "now" and
  * always attempts. With the jitter pinned to 0 (see `makeClient`), the window after the n-th
  * consecutive failure is exactly `min(60 s, 2^n s) / 2`: 1 s, 2 s, 4 s, and so on.
@@ -99,6 +100,59 @@ class BackoffTest {
         assertEquals("the header is obeyed up to the ceiling", listOf(2), rig.transport.requestSizes())
         rig.scheduler.advance(1.seconds)
         assertEquals("and never past it", listOf(2, 3), rig.transport.requestSizes())
+        assertTrue(rig.client.pendingSignals().isEmpty())
+    }
+
+    /**
+     * A 503 is the case the header exists for: a maintenance window or a load shed stating how
+     * long to stay away. A 429 is the narrower one, where this install alone is being throttled.
+     * Reading the header on the narrow case only leaves the SDK backing off on its own schedule
+     * exactly when a server has asked, in as many words, for room.
+     */
+    @Test
+    fun `a numeric Retry-After is honoured on a 503, not on a 429 alone`() {
+        val rig = Rig()
+        rig.transport.retryAfterSeconds = 90
+        rig.transport.script(503)
+        rig.client.track("a", null)
+        rig.client.track("b", null)                  // refused with Retry-After: 90
+        rig.client.track("c", null)                  // deferred to the server's floor, not the 1 s jitter
+        rig.scheduler.advance(89.seconds)
+        assertEquals("the server said ninety seconds", listOf(2), rig.transport.requestSizes())
+        rig.scheduler.advance(1.seconds)
+        assertEquals(listOf(2, 3), rig.transport.requestSizes())
+        assertTrue(rig.client.pendingSignals().isEmpty())
+    }
+
+    /**
+     * Ten attempts in, a server is having an outage rather than a blip, and retrying every 30 to
+     * 60 s for the length of it re-uploads the same head slice at an ingest that can least absorb
+     * the herd. Nothing is lost by waiting: the queue is on disk, and an explicit flush, the flush
+     * on the way to the background, and the next tracked event all ignore the window.
+     */
+    @Test
+    fun `a sustained outage widens the ceiling to five minutes`() {
+        val rig = Rig(random = { 1.0 })              // jitter pinned to the top of the window
+        rig.transport.script(*IntArray(11) { 503 })
+        rig.client.track("a", null)
+        rig.client.track("b", null)                  // failure 1: the window it arms is 2 s
+        // Failures 2 through 11, each advanced by exactly the window the failure before it armed.
+        // The doubling runs into the 60 s ceiling at the sixth and sits there through the tenth.
+        for (window in listOf(2, 4, 8, 16, 32, 60, 60, 60, 60, 60)) {
+            rig.scheduler.advance(window.seconds)
+        }
+        val attempts = rig.transport.requestSizes().size
+        assertEquals("eleven refusals, one per window", 11, attempts)
+
+        rig.client.track("late", null)               // deferred by the eleventh failure's window
+        rig.scheduler.advance(299.seconds)
+        assertEquals(
+            "past ten consecutive failures the wait is five minutes, not one",
+            attempts,
+            rig.transport.requestSizes().size,
+        )
+        rig.scheduler.advance(1.seconds)             // exactly five minutes: delivered
+        assertEquals(attempts + 1, rig.transport.requestSizes().size)
         assertTrue(rig.client.pendingSignals().isEmpty())
     }
 

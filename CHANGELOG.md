@@ -6,6 +6,25 @@ All notable changes to the AppGlance Android SDK (`app.appglance:appglance`). Th
 [GitHub Release](https://github.com/AppGlance/appglance-android/releases) with the same notes.
 The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-apple/blob/main/CHANGELOG.md).
 
+## [Unreleased]
+
+### Changed
+
+- Automatic delivery backs off further during a long outage. The retry ceiling stays at 60 seconds
+  for the first ten consecutive failures and widens to five minutes past that: ten attempts in, a
+  server is having an outage rather than a blip, and retrying every 30 to 60 seconds for the length
+  of it re-uploads the same head slice at an ingest that can least absorb the herd. Nothing is lost
+  by waiting, because the queue is on disk and `flush()`, the flush on the way to the background
+  and the next tracked event all ignore the window. The Swift SDK has widened its ceiling at the
+  same streak since 1.2.0, so the two agree again.
+
+### Fixed
+
+- The documented `Retry-After` rule matches what the SDK does. 1.2.0 widened the header to any
+  answered status, but its own note and the README both described the narrower `429`-only rule
+  that the SDK had up to 1.1.0, and the Swift changelog repeated it. The code was right and three
+  documents were wrong. They now say any answered status.
+
 ## [1.2.0] - 2026-08-19
 
 ### Fixed
@@ -201,9 +220,11 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
   after `heartbeatInterval` of silence in the foreground, and none while real events are flowing.
   It still promised a ping every interval, which the SDK stopped sending in 1.1.0. The README's
   setup section was corrected in 1.2.0; this is the doc comment beside it.
-- The README no longer promises that a `Retry-After` is honoured on any retryable answer: the SDK
-  reads it on a `429`, and backs off on its own schedule otherwise. The Swift SDK reads the header
-  on any answered status, so the two differ here until this one is widened to match.
+- A numeric `Retry-After` is honoured on any answered status, not on a `429` alone. A `503` that
+  states one was ignored, and the SDK backed off on its own schedule instead, which is the case
+  the header exists for: a maintenance window or a load shed asking for room. The fifteen minute
+  clamp still bounds it, and `flush()` and the flush on the way to the background still ignore the
+  window entirely. The Swift SDK makes the same change.
 - Configuration values are clamped instead of refused. `heartbeatInterval = 0.seconds` (a
   plausible guess for "no presence pings", which is not a thing the SDK offers) and a zero batch
   size threw out of the `Configuration` constructor, so a number computed at runtime could take

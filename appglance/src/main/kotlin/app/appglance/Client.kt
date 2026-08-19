@@ -901,15 +901,28 @@ internal class Client(
 
     /**
      * Arms the automatic-retry throttle after a retryable failure and answers the window it armed.
-     * The next automatic drain waits `min(60 s, 2^failures seconds)`, jittered into the upper half
-     * of that window so clients that failed together do not all retry together, and never less
-     * than the server's own numeric `Retry-After`, which is itself clamped (see
-     * [obeyableRetryAfterMillis]). A successful send clears it; [flush] ignores it (see
-     * [flushSoon]).
+     * The next automatic drain waits `min(ceiling, 2^failures seconds)`, jittered into the upper
+     * half of that window so clients that failed together do not all retry together, and never
+     * less than the server's own numeric `Retry-After`, which is itself clamped (see
+     * [obeyableRetryAfterMillis]) and is read from any answered status, not from a `429` alone.
+     * A successful send clears it; [flush] ignores it (see [flushSoon]).
+     *
+     * The ceiling is [MAX_BACKOFF_MILLIS] for the first [SUSTAINED_OUTAGE_AFTER] consecutive
+     * failures and [SUSTAINED_OUTAGE_BACKOFF_MILLIS] past that. A minute is the right cadence for
+     * a server that is briefly unwell; something that has already survived ten attempts is an
+     * outage, and retrying every 30 to 60 s for the length of it re-uploads the same head slice
+     * over and over at an ingest that can least absorb the herd. Waiting longer loses nothing:
+     * the queue is on disk, [flush] and the flush on the way to the background both ignore the
+     * backoff, and a track or a presence ping re-arms the timer, so the install is still looked at
+     * once a cadence. The Swift SDK widens its ceiling at the same streak.
      */
     private fun backOff(retryAfterSeconds: Long?): Long = synchronized(queueLock) {
         failureStreak++
-        val base = minOf(MAX_BACKOFF_MILLIS, (1L shl minOf(failureStreak, 6)) * 1_000L)
+        val ceiling =
+            if (failureStreak > SUSTAINED_OUTAGE_AFTER) SUSTAINED_OUTAGE_BACKOFF_MILLIS else MAX_BACKOFF_MILLIS
+        // Capped at 2^9 s so the shift cannot run away; 512 s is past the widest ceiling, so the
+        // cap is never what decides the window.
+        val base = minOf(ceiling, (1L shl minOf(failureStreak, 9)) * 1_000L)
         val jittered = base / 2 + (random() * (base / 2)).toLong()
         val holdMillis = maxOf(jittered, obeyableRetryAfterMillis(retryAfterSeconds))
         nextAttemptAt = now() + holdMillis
@@ -1059,8 +1072,14 @@ internal class Client(
         /** Hard cap on the queue, so repeated failures cannot grow it without bound. */
         const val MAX_QUEUED_EVENTS: Int = 500
 
-        /** Ceiling on the automatic-retry backoff window. */
+        /** Ceiling on the automatic-retry backoff window while a failure still looks like a blip. */
         const val MAX_BACKOFF_MILLIS: Long = 60_000L
+
+        /** The wider ceiling a sustained outage earns. See [backOff]. */
+        const val SUSTAINED_OUTAGE_BACKOFF_MILLIS: Long = 300_000L
+
+        /** Consecutive failures past which [SUSTAINED_OUTAGE_BACKOFF_MILLIS] is the ceiling. */
+        const val SUSTAINED_OUTAGE_AFTER: Int = 10
 
         /**
          * The longest wait the SDK obeys from a `Retry-After`. Past this it is not rate limiting
