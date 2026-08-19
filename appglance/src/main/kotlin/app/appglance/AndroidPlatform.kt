@@ -131,7 +131,13 @@ internal class AndroidPlatform(
         private val atomic = AtomicFile(file)
 
         override fun load(): String? {
-            if (!file.exists()) return null
+            // No short circuit on the base file's absence. AtomicFile moves the previous copy to a
+            // `.bak` name for the length of a write and restores it on the next read, so a process
+            // killed between startWrite and finishWrite leaves the only good queue under that name
+            // and nothing under this one. Answering from `file.exists()` alone reported an empty
+            // queue in exactly the case the backup exists to survive, and every event in it was
+            // dropped. readFully performs that recovery, and still raises for a queue that really
+            // is not there.
             return try {
                 String(atomic.readFully(), Charsets.UTF_8)
             } catch (_: IOException) {
@@ -150,6 +156,13 @@ internal class AndroidPlatform(
             }
             return try {
                 out.write(json.toByteArray(Charsets.UTF_8))
+                // Flushed and synced here rather than left to finishWrite, which logs a failure to
+                // close and swallows it. The boolean this returns is what the client records as the
+                // bytes that landed, and it skips an identical write against that record, so a
+                // `true` for a write the device never completed is not one lost queue but every
+                // repair of it declined until the bytes change.
+                out.flush()
+                out.fd.sync()
                 atomic.finishWrite(out)
                 true
             } catch (_: IOException) {

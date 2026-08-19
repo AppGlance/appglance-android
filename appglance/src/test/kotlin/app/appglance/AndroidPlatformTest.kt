@@ -122,6 +122,29 @@ class AndroidPlatformTest {
         assertFalse("withdrawn", store.exists())
     }
 
+    /**
+     * The shape a process killed mid-write leaves behind: AtomicFile moved the good copy to the
+     * `.bak` name and the base file is not there yet. Reading from the base file's presence alone
+     * called that an empty queue and dropped every event in it, which is the one case the backup
+     * exists to survive.
+     */
+    @Test
+    fun `a queue left only in the backup is recovered, not read as empty`() {
+        val store = AndroidPlatform(app).queueStore("com.example.crash")
+        store.save("[{\"signal\":\"kept\"}]")
+        val dir = File(app.noBackupFilesDir, "appglance")
+        val base = dir.listFiles()!!.single { it.name.endsWith(".json") }
+        assertTrue("the good copy moves to the backup name", base.renameTo(File(base.path + ".bak")))
+        assertFalse("and the base is gone, as it is between startWrite and finishWrite", base.exists())
+
+        assertEquals("[{\"signal\":\"kept\"}]", store.load())
+        assertEquals(
+            "a second launch reads it too",
+            "[{\"signal\":\"kept\"}]",
+            AndroidPlatform(app).queueStore("com.example.crash").load(),
+        )
+    }
+
     @Test
     fun `prefs store round-trips longs, strings and markers and forgets on remove`() {
         val prefs = AndroidPlatform(app).prefs
