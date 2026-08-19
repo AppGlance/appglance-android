@@ -13,7 +13,7 @@ id, and one call of setup. Sessions and presence are handled for you. The Swift 
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation("app.appglance:appglance:1.2.1")
+    implementation("app.appglance:appglance:1.2.2")
 }
 ```
 
