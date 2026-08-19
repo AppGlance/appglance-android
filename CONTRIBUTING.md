@@ -22,12 +22,12 @@ agree on the shape.
 
 1. Bump `version` in `appglance/build.gradle.kts`, move the `[Unreleased]` entries in
    `CHANGELOG.md` under a new `## [x.y.z] - YYYY-MM-DD` heading, and commit.
-2. Re-measure the footprint. The README and the appglance.app homepage quote it ("under 100 KB",
-   "~600 DEX methods", one AndroidX dependency), and a stale number is worse than none:
+2. Re-measure the footprint. The README quotes it ("a little over 100 KB", "~600 DEX methods",
+   one AndroidX dependency), and a stale number is worse than none:
 
    ```bash
    ./gradlew :appglance:assembleRelease
-   ls -l appglance/build/outputs/aar/appglance-release.aar        # 1.0.0: 83 KB, 1.2.0: 96 KB
+   ls -l appglance/build/outputs/aar/appglance-release.aar        # 1.0.0: 83 KB, 1.2.1: 107 KB
    ./gradlew :appglance:dependencies --configuration releaseRuntimeClasspath   # still only lifecycle-process?
    ```
 

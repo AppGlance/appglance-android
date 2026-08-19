@@ -26,7 +26,7 @@ is all it needs. The `INTERNET` permission comes with the library's manifest.
 | Kotlin / JDK for building | 2.x / 17 |
 | Dependencies | `androidx.lifecycle:lifecycle-process` (2.8) |
 
-The release AAR is about 100 KB (some 600 DEX method references) and pulls in nothing an
+The release AAR is a little over 100 KB (some 600 DEX method references) and pulls in nothing an
 AndroidX app does not already have.
 
 ## Set up
