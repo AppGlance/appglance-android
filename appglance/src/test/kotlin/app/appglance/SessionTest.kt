@@ -41,11 +41,15 @@ class SessionTest {
             executor = executor,
         )
 
+        /** The queue file for the app id under test. */
+        val store: InMemoryQueueStore get() = platform.queues.getValue(config.appId!!)
+
         /** The signals persisted for the app id - what a relaunch would load. */
-        fun onDisk(): List<String> {
-            val json = platform.queues.getValue(config.appId!!).json!!
-            return EventCoding.decode(json).map { it.signal }
-        }
+        fun onDisk(): List<String> = EventCoding.decode(store.json!!).map { it.signal }
+
+        /** Writes the client really made. Skipping a write and writing the same bytes again look
+         *  identical from the file, so a test has to be told which happened. */
+        fun writes(): Int = store.writes
     }
 
     @Test
@@ -201,6 +205,173 @@ class SessionTest {
             "but long before t120 - the server has had no proof of presence since t0",
             1,
             client.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+    }
+
+    /**
+     * A permanent 4xx drops the slice instead of putting it back, so the pings in it are gone the
+     * same way - and they were never counted, because the ingest rejects a batch like that before
+     * it reads a row. Left stamped, the next ping is not due for a full interval, and at the
+     * four-minute cadence a free-plan account is asked for two of those back to back are longer
+     * than the dashboard's five-minute presence window.
+     */
+    @Test
+    fun `a ping dropped by a permanent rejection does not spend its whole interval either`() {
+        val rig = Rig()
+        val client = rig.launch()
+        client.setActive(true)                       // session.start at t0
+        rig.scheduler.advance(60.seconds)            // a quiet minute: one ping, stamped t60
+        assertEquals(1, client.pendingSignals().count { it == Signal.HEARTBEAT })
+
+        rig.transport.script(400)
+        client.flush()                               // never acceptable as sent: the slice is dropped whole
+        assertTrue("dropped, not kept for a retry", client.pendingSignals().isEmpty())
+
+        rig.scheduler.advance(Client.MIN_HEARTBEAT_RETRY_MILLIS - 1)
+        assertEquals(
+            "not instantly: the dropped ping may have landed after all",
+            0,
+            client.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+        rig.scheduler.advance(1)
+        assertEquals(
+            "but long before t120 - the server has had no proof of presence since t0",
+            1,
+            client.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+    }
+
+    /**
+     * A stamp the clock has not reached yet: written while the device was hours ahead, read back
+     * after the correction. The silence it measures reads as negative, so the next ping is due
+     * hours out, and every relaunch reads the same stamp and owes the same nothing.
+     */
+    @Test
+    fun `a presence stamp from the future does not silence the loop`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        val now = rig.clock.now
+        // A session that is still resumable, so this launch records no session.start of its own:
+        // a ping is then the only thing that can prove the install is in front of someone.
+        rig.platform.prefs.putLong("lastActive.$appId", now - 30_000L)
+        rig.platform.prefs.putString("session.$appId", "11111111-1111-1111-1111-111111111111")
+        rig.platform.prefs.putLong("lastEvent.$appId", now - 600_000L)
+        rig.platform.prefs.putLong("lastHeartbeat.$appId", now + 7_200_000L)
+
+        val client = rig.launch()
+        client.setActive(true)
+        rig.scheduler.settle()
+
+        assertEquals(
+            "a stamp two hours ahead of the clock is not proof that anyone was here",
+            listOf(Signal.HEARTBEAT),
+            client.pendingSignals(),
+        )
+    }
+
+    /**
+     * The stamp a dropped ping rolls back to is the newest one the server acknowledged, and a
+     * number the clock has not reached yet is not that: believing it would write the impossible
+     * value back to disk for the next launch to read, which is where a stamp from a wrong clock
+     * outlives the wrong clock.
+     */
+    @Test
+    fun `a stamp from the future is not what a dropped ping rolls back to`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        val now = rig.clock.now
+        rig.platform.prefs.putLong("lastActive.$appId", now - 30_000L)
+        rig.platform.prefs.putString("session.$appId", "55555555-5555-5555-5555-555555555555")
+        rig.platform.prefs.putLong("lastHeartbeat.$appId", now + 7_200_000L)
+
+        val client = rig.launch()
+        client.setActive(true)
+        rig.scheduler.settle()                  // the ping this install is owed, stamped now
+        rig.transport.script(503)
+        client.flush()                          // the server answered, so the ping is dropped
+
+        val stamp = rig.platform.prefs.getLong("lastHeartbeat.$appId")
+        assertTrue(
+            "rolled back to nothing, not to a moment that has not happened yet (got $stamp)",
+            stamp == null || stamp <= rig.clock.now,
+        )
+    }
+
+    /**
+     * The same fault from inside one visit: a clock corrected backwards leaves the stamps this
+     * process wrote ahead of it. The wait is what paces the whole presence loop, so it is bounded
+     * by one interval however the arithmetic comes out.
+     */
+    @Test
+    fun `a clock that steps backwards cannot stretch the wait`() {
+        val rig = Rig()
+        val client = rig.launch()
+        client.setActive(true)                  // session.start proves presence at t0
+        rig.clock.advance(-7_200_000L)          // two hours backwards, mid-visit
+
+        assertEquals(
+            "the gap cannot be measured, so it reads as unbounded and a ping is owed now. One whole " +
+                "interval is what dropping the guard returns, and it is inside any range this could be " +
+                "asserted against",
+            0L,
+            client.millisUntilNextHeartbeat(),
+        )
+    }
+
+    /**
+     * A visit that records nothing at all - a resumed session, no event tracked, no ping due yet -
+     * still closes with one, so the session's length on the dashboard ends where the visit ended.
+     * A missing stamp is an unbounded silence, not a number to subtract; the Swift SDK closes the
+     * same visit the same way.
+     */
+    @Test
+    fun `a visit with no presence stamp at all still closes with a ping`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        // Resumable, and with neither presence stamp on disk: the last visit was shorter than one
+        // interval, so it left no ping behind, and its events have long since been sent.
+        rig.platform.prefs.putLong("lastActive.$appId", rig.clock.now - 30_000L)
+        rig.platform.prefs.putString("session.$appId", "22222222-2222-2222-2222-222222222222")
+
+        val client = rig.launch()
+        client.setActive(true)                  // a resume: nothing recorded
+        assertEquals(emptyList<String>(), client.pendingSignals())
+
+        client.setActive(false)                 // which flushes, so the ping is on the wire at once
+        assertEquals(
+            "leaving still ends the session where the visit ended",
+            listOf(Signal.HEARTBEAT),
+            rig.transport.signals(),
+        )
+    }
+
+    /**
+     * A process that pre-mints a session id and dies before any foreground hands it to the next
+     * launch. The hand-over must not turn on the gap still looking wide: the events already queued
+     * carry that id, so a launch that measures a resumable gap instead - the one way the two can
+     * disagree is a clock corrected backwards under a stamp this install wrote - leaves them in a
+     * session the server is never told about.
+     */
+    @Test
+    fun `an unadopted session id is picked up whatever the gap looks like`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        rig.platform.prefs.putString("session.pending.$appId", "33333333-3333-3333-3333-333333333333")
+        rig.platform.prefs.putString("session.$appId", "44444444-4444-4444-4444-444444444444")
+        rig.platform.prefs.putLong("lastActive.$appId", rig.clock.now - 30_000L)   // says: still inside the session
+
+        val client = rig.launch()
+        assertEquals(
+            "the id the dead process queued events under, not the one the stamp points at",
+            "33333333-3333-3333-3333-333333333333",
+            client.currentSessionId(),
+        )
+        client.setActive(true)
+        rig.scheduler.settle()
+        assertEquals(listOf(Signal.SESSION_START), client.pendingSignals())
+        assertNull(
+            "and it is adopted exactly once",
+            rig.platform.prefs.getString("session.pending.$appId"),
         )
     }
 
@@ -530,6 +701,9 @@ class SessionTest {
      * The on-disk queue is what a relaunch sends. While a slice is on the wire, the disk shows its
      * real events as still owed and its heartbeats as gone - so a process killed before the
      * response arrives replays the events (deduplicated by id) and never the pings.
+     *
+     * An event tracked while that slice is on the wire is past the bound the delivery set out
+     * with, so it stays owed until the next delivery rather than extending this one.
      */
     @Test
     fun `the queue on disk never contains an in-flight heartbeat`() {
@@ -562,6 +736,19 @@ class SessionTest {
 
             gate.countDown()
             executor.submit {}.get(5, TimeUnit.SECONDS)
+            assertEquals(
+                "the delivery carries what it set out to send, and no more",
+                listOf(Signal.SESSION_START, Signal.HEARTBEAT, "purchase"),
+                rig.transport.signals(),
+            )
+            assertEquals(
+                "what was tracked mid-flight is still owed, and the disk says so",
+                listOf("later"),
+                rig.onDisk(),
+            )
+
+            client.flush()                       // the next delivery is what takes it
+            executor.submit {}.get(5, TimeUnit.SECONDS)
             assertEquals(listOf(Signal.SESSION_START, Signal.HEARTBEAT, "purchase", "later"), rig.transport.signals())
             assertEquals("acknowledged: nothing is owed", emptyList<String>(), rig.onDisk())
         } finally {
@@ -589,6 +776,110 @@ class SessionTest {
         assertTrue("retired: nothing is recorded", old.pendingSignals().isEmpty())
         assertEquals("retired: nothing is sent", emptyList<String>(), rig.transport.signals())
         assertEquals("the file is untouched", listOf("before"), rig.onDisk())
+    }
+
+    /**
+     * The elision remembers what LANDED, not what was offered. A store that refuses a write and
+     * says so must not leave the client believing the file holds those bytes, because the write
+     * that follows is very often the identical one: claiming a slice and putting it back both
+     * write the union of the queue and the in-flight batch, which is the same set. Skipping that
+     * one against a file that never received it leaves the disk a whole event behind the client,
+     * and a kill in between loses it - the one way this optimisation could cost events.
+     */
+    @Test
+    fun `a queue write that did not land is not remembered as though it had`() {
+        val rig = Rig()
+        val client = rig.launch()
+        client.track("a", null)
+        assertEquals("the first write is on disk", listOf("a"), rig.onDisk())
+
+        rig.store.failWrites = true
+        client.track("b", null)
+        assertEquals("the refused write left the file as it was", listOf("a"), rig.onDisk())
+
+        // The disk frees up, and the next write carries exactly the bytes the refused one did:
+        // claiming a slice with no ping in it and putting it back is the commonest write there is.
+        rig.store.failWrites = false
+        rig.transport.script(503)
+        client.flush()
+
+        assertEquals(
+            "the write the elision would have skipped is the one that repairs the file",
+            listOf("a", "b"),
+            rig.onDisk(),
+        )
+    }
+
+    /**
+     * Claiming a slice moves events out of the queue and into the in-flight batch, and the file
+     * holds the union of the two - so a slice with no presence ping in it leaves the file saying
+     * exactly what it already said, and putting that slice back after a transient failure says it
+     * again. Neither write carries any information, and an atomic rewrite costs the same whatever
+     * it carries. The on-disk assertions are the point: eliding the write must not change a byte
+     * of what a relaunch would find.
+     */
+    @Test
+    fun `a slice with no presence ping is claimed and returned without rewriting the file`() {
+        val rig = Rig()
+        val client = rig.launch()
+        client.track("a", null)
+        client.track("b", null)
+        assertEquals("one write per tracked event - that is the durability guarantee", 2, rig.writes())
+
+        rig.transport.script(503)
+        client.flush()
+        assertEquals("claimed and put back for the same answer: nothing to write", 2, rig.writes())
+        assertEquals("and both are still owed", listOf("a", "b"), rig.onDisk())
+
+        client.flush()                      // 202 this time
+        assertEquals("an acknowledgement does change what is owed", 3, rig.writes())
+        assertEquals(emptyList<String>(), rig.onDisk())
+    }
+
+    /**
+     * The write that can never be elided. Claiming a slice that carries a presence ping takes that
+     * ping off disk, and it has to be off disk before the request leaves: the server folds pings
+     * additively and never dedupes them, so a kill mid-send that left one on the file would have
+     * the next launch send it again and the count would be wrong for good.
+     */
+    @Test
+    fun `claiming a slice that carries a ping still rewrites the file`() {
+        val rig = Rig()
+        val client = rig.launch()
+        client.setActive(true)
+        rig.scheduler.advance(60.seconds)   // a quiet minute: session.start, then one ping
+        client.track("purchase", null)
+        val before = rig.writes()
+
+        var inFlight: List<String>? = null
+        rig.transport.onSend = { inFlight = rig.onDisk() }
+        client.flush()
+
+        assertEquals(
+            "the ping is off disk before the request leaves; the real events stay owed",
+            listOf(Signal.SESSION_START, "purchase"),
+            inFlight,
+        )
+        assertTrue("taking the ping off disk is a change, so it is a write", rig.writes() > before)
+    }
+
+    /**
+     * A write is elided against what the file already holds, so the file has to be there. An
+     * interrupted atomic write can leave only the backup, and the Apple SDK keeps the same file in
+     * a directory the system may reclaim at any moment. A queue that is nowhere at all is the one
+     * outcome this must never produce, so presence is confirmed before anything is skipped.
+     */
+    @Test
+    fun `an identical write is not skipped when the file has gone`() {
+        val rig = Rig()
+        val client = rig.launch()
+        client.track("a", null)
+        rig.store.delete()
+
+        rig.transport.script(503)
+        client.flush()                      // claims the slice and puts it back: the same bytes
+
+        assertEquals("written again, not skipped against a file that is gone", listOf("a"), rig.onDisk())
     }
 
     @Test
@@ -789,5 +1080,423 @@ class SessionTest {
         )
         second.flush()
         assertEquals(setOf(sid), rig.transport.batches().flatten().map { it.sessionId }.toSet())
+    }
+
+    /**
+     * The id a `session.start` carries has to be on disk before the event is, because `track`
+     * persists the queue as it records. A process killed in that window - a force-quit as the app
+     * is coming back - otherwise leaves a start for a session nothing on disk names, and the next
+     * launch inside the timeout resumes the id before it and files the whole visit under a session
+     * whose start was never sent. The pre-minted id has always been written in this order; the
+     * in-process mint is the one that was not.
+     */
+    @Test
+    fun `a second session in one process writes its id down before the event that carries it`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        val client = rig.launch()
+        client.setActive(true)                       // the pre-minted session opens
+        rig.scheduler.settle()
+        client.setActive(false)                      // and flushes, so the queue file is empty
+        rig.clock.advance(6.minutes)                 // past the timeout: the next foreground mints in-process
+
+        var carried: String? = null
+        var onDisk: String? = null
+        rig.platform.queues.getValue(appId).onSave = { json ->
+            val start = EventCoding.decode(json).firstOrNull { it.signal == Signal.SESSION_START }
+            if (start != null && carried == null) {
+                carried = start.sessionId
+                onDisk = rig.platform.prefs.getString("session.$appId")
+            }
+        }
+        client.setActive(true)
+
+        assertNotNull("the session.start reached the queue file", carried)
+        assertEquals(
+            "the id on disk the moment the start was written is the id the start carries",
+            carried,
+            onDisk,
+        )
+    }
+
+    /**
+     * The other half of the same fault, read for what it costs. Every question the stamps are
+     * asked is safe when the answer is "a long time" and stuck when it is "not yet": a negative gap
+     * read as zero means the closing tick never fires, so a visit that ends under a corrected clock
+     * is never given an end at all.
+     */
+    @Test
+    fun `a clock that steps backwards still closes the visit`() {
+        val rig = Rig()
+        val client = makeClient(
+            rig.platform,
+            rig.clock,
+            rig.scheduler,
+            rig.transport,
+            config = testConfiguration(heartbeatInterval = 1.hours),   // no periodic ping in this test
+        )
+        client.setActive(true)                  // session.start proves presence at t0
+        rig.scheduler.settle()
+        rig.clock.advance(-7_200_000L)          // two hours backwards, mid-visit
+
+        client.setActive(false)
+        assertEquals(
+            "the visit ends where it ended, with one closing ping",
+            listOf(Signal.SESSION_START, Signal.HEARTBEAT),
+            rig.transport.signals(),
+        )
+    }
+
+    /**
+     * The session boundary itself. The rule is "longer than `sessionTimeout`", so the boundary
+     * resumes and only a gap past it starts a new visit. Everything else here drives either a few
+     * seconds away or one well clear of the timeout, which leaves the whole of the upper half of
+     * the window unpinned: an SDK that halved the configured timeout would stay green while a
+     * 20-minute app switch split one visit into two sessions - the count doubled, the average
+     * length halved, and neither agreeing with the server's own gap rule any more.
+     */
+    @Test
+    fun `a gap up to the session timeout resumes and one past it does not`() {
+        val rig = Rig()
+        val client = makeClient(
+            rig.platform,
+            rig.clock,
+            rig.scheduler,
+            rig.transport,
+            config = testConfiguration(sessionTimeout = 30.minutes, heartbeatInterval = 1.hours),
+        )
+        client.setActive(true)                       // session.start at t0
+        val visit = client.currentSessionId()
+        client.setActive(false)
+
+        rig.clock.advance(20.minutes)                // two thirds of the way out: an app switch
+        client.setActive(true)
+        assertEquals("twenty minutes away is an interruption, not a new visit", visit, client.currentSessionId())
+        client.setActive(false)
+
+        rig.clock.advance(30.minutes)                // exactly the timeout
+        client.setActive(true)
+        assertEquals("the boundary itself resumes: the rule is longer than", visit, client.currentSessionId())
+        client.setActive(false)
+
+        rig.clock.advance(30.minutes)
+        rig.clock.advance(1)                         // and one millisecond past it does not
+        client.setActive(true)
+        assertNotEquals(visit, client.currentSessionId())
+        client.flush()
+        assertEquals(
+            "two visits over the four returns",
+            2,
+            rig.transport.signals().count { it == Signal.SESSION_START },
+        )
+    }
+
+    /**
+     * A rollback is posted from the send loop and applied on the command thread, so a ping stamped
+     * in that window is newer than the one being undone. Rolling back past it re-arms the presence
+     * loop against a moment the queue has already moved beyond: a second ping goes out while the
+     * newer one is still queued, both are delivered, and both are folded into the additive presence
+     * and session-length rollups. That is the permanent double count the whole
+     * drop-rather-than-retry design exists to prevent.
+     */
+    @Test
+    fun `a rollback never undoes a ping stamped while it was in flight`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        val client = rig.launch()
+        client.setActive(true)                       // session.start at t0
+        rig.scheduler.advance(60.seconds)            // a quiet minute: one ping, stamped t60
+        val newer = rig.clock.now + 60_000L          // where the ping after it will land
+
+        var tickedMidFlight = false
+        rig.transport.onSend = {
+            if (!tickedMidFlight) {
+                tickedMidFlight = true
+                rig.scheduler.advance(60.seconds)    // the presence loop ticks while the batch is out
+            }
+        }
+        rig.transport.script(503)
+        client.flush()                               // the server answered, so the ping in the batch is dropped
+
+        assertTrue("the loop really did tick mid-send", tickedMidFlight)
+        assertEquals(
+            "the ping stamped meanwhile paces us now, and the rollback must leave it alone",
+            newer,
+            requireNotNull(rig.platform.prefs.getLong("lastHeartbeat.$appId")),
+        )
+        assertEquals(
+            "which is the one ping still owed",
+            1,
+            client.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+        rig.scheduler.advance(59.seconds)
+        assertEquals(
+            "and no second tick inside the interval it opened",
+            1,
+            client.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+    }
+
+    /**
+     * At most one drain waits behind the one running. The send executor is serial and each slice is
+     * claimed out of the queue under the lock before its request, so the extra drains a burst of
+     * triggers would submit find nothing to send - but the hop is paid per trigger, and the
+     * triggers are the flush timer and every full batch.
+     */
+    @Test
+    fun `overlapping flush requests collapse onto a single queued drain`() {
+        val rig = Rig()
+        val executor = Executors.newSingleThreadExecutor()
+        val counted = CountingExecutor(executor)
+        try {
+            val client = makeClient(rig.platform, rig.clock, rig.scheduler, rig.transport, executor = counted)
+            client.track("a", null)
+            val arrived = CountDownLatch(1)
+            val gate = CountDownLatch(1)
+            rig.transport.arrived = arrived
+            rig.transport.gate = gate
+            client.flush()                           // claims the batch, blocks in send
+            assertTrue(arrived.await(5, TimeUnit.SECONDS))
+            client.flush()                           // one drain lines up behind it
+            client.flush()                           // and these two join that one
+            client.flush()
+            gate.countDown()
+            executor.submit {}.get(5, TimeUnit.SECONDS)
+
+            assertEquals("four flushes, two drains", 2, counted.submitted)
+            assertEquals(listOf("a"), rig.transport.signals())
+            assertEquals("one request, not four", listOf(1), rig.transport.requestSizes())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    /**
+     * The retired client's last write is the dangerous one. [Client.shutdown] clears its queue
+     * under the lock, but a send already on the wire keeps running, and its answer leads back into
+     * the persist path - where what it would write is an empty array over the file the replacement
+     * has just saved its own queue into. A `configure` landing mid-send would erase everything the
+     * replacement had queued, and a kill after that loses all of it.
+     */
+    @Test
+    fun `a send that lands after the client is retired does not clobber the replacement's queue`() {
+        val rig = Rig()
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val old = makeClient(rig.platform, rig.clock, rig.scheduler, rig.transport, executor = executor)
+            old.track("before", null)
+            val arrived = CountDownLatch(1)
+            val gate = CountDownLatch(1)
+            rig.transport.arrived = arrived
+            rig.transport.gate = gate
+            old.flush()                              // claims the batch, blocks in send
+            assertTrue(arrived.await(5, TimeUnit.SECONDS))
+
+            old.shutdown()                           // a second configure replaces it mid-send
+            val replacement = rig.launch()
+            replacement.track("after", null)
+            assertEquals(listOf("before", "after"), rig.onDisk())
+
+            gate.countDown()
+            executor.submit {}.get(5, TimeUnit.SECONDS)
+            assertEquals(
+                "the replacement owns that file now",
+                listOf("before", "after"),
+                rig.onDisk(),
+            )
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    /**
+     * The closing ping is a ping like any other, so the stamp moves with it. Left unstamped it is
+     * invisible to everything that paces the loop: the user comes back a few seconds later,
+     * `startHeartbeat` reads a stamp from before the visit ended and fires again at once - two
+     * ticks within seconds, both delivered, both folded into the additive rollups. A relaunch
+     * inside the timeout has the same problem, because nothing on disk records the closing ping
+     * either.
+     */
+    @Test
+    fun `the closing ping moves the presence stamp, so coming back does not tick again`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        val client = rig.launch()
+        client.setActive(true)                       // session.start proves presence at t0
+        rig.scheduler.settle()
+        rig.clock.advance(90.seconds)                // quiet, and the loop is never given the chance to tick
+        client.setActive(false)                      // so this is the visit's only ping, stamped t90
+
+        assertEquals(listOf(Signal.SESSION_START, Signal.HEARTBEAT), rig.transport.signals())
+        assertEquals(
+            "queued and stamped together, like every other ping",
+            rig.clock.now,
+            requireNotNull(rig.platform.prefs.getLong("lastHeartbeat.$appId")),
+        )
+
+        rig.clock.advance(10.seconds)
+        client.setActive(true)                       // back ten seconds later
+        rig.scheduler.settle()
+        assertEquals(
+            "the server heard from this install ten seconds ago; it owes nothing yet",
+            0,
+            client.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+        rig.scheduler.advance(50.seconds)
+        assertEquals(
+            "and the next tick lands a full interval after the closing one",
+            1,
+            client.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+    }
+
+    /**
+     * The acknowledged-ping stamp is what a dropped ping rolls back TO, so it may only move
+     * forward. A clock corrected backwards mid-visit is how an older ping comes to be acknowledged
+     * after a newer one: the closing tick is stamped with the corrected clock, and taking that as
+     * the newest thing the server knows would send the next rollback further into the past than the
+     * server's real knowledge - so the install pings again inside an interval it had already
+     * proved, and presence is counted twice.
+     */
+    @Test
+    fun `the acknowledged-ping stamp never moves backwards`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        val start = rig.clock.now
+        val client = rig.launch()
+        client.setActive(true)                       // session.start at t0
+        rig.scheduler.advance(60.seconds)            // a ping at t60
+        client.flush()                               // acknowledged: the server knows about t60
+
+        rig.clock.advance(-30_000L)                  // a time server nudges the clock back to t30
+        client.setActive(false)                      // the closing tick is stamped t30, and acknowledged too
+        assertEquals(2, rig.transport.signals().count { it == Signal.HEARTBEAT })
+
+        rig.clock.advance(10_000L)                   // reopened at t40, inside the timeout
+        client.setActive(true)
+        rig.scheduler.advance(50.seconds)            // a ping at t90
+        rig.transport.script(503)
+        client.flush()                               // dropped, so the stamp rolls back
+
+        assertEquals(
+            "to t60, the newest ping the server acknowledged, never to the older one behind it",
+            start + 60_000L,
+            requireNotNull(rig.platform.prefs.getLong("lastHeartbeat.$appId")),
+        )
+        rig.scheduler.advance(29.seconds)
+        assertEquals(
+            "so the replacement ping waits out the interval t60 already proved",
+            0,
+            client.pendingSignals().count { it == Signal.HEARTBEAT },
+        )
+        rig.scheduler.advance(1.seconds)
+        assertEquals(1, client.pendingSignals().count { it == Signal.HEARTBEAT })
+    }
+
+    /**
+     * A stamp at or before the epoch is not one a running device wrote; it is what a handset whose
+     * RTC was never set leaves behind. In the arithmetic it is harmless - an enormous elapsed time
+     * answers every question the way an absent stamp does - but it also seeds the acknowledged-ping
+     * stamp with a number instead of nothing, and a rollback then writes that nonsense back to disk
+     * for every launch after this one, instead of removing the key.
+     */
+    @Test
+    fun `a stamp at the epoch is discarded rather than carried forward`() {
+        val rig = Rig()
+        val appId = rig.config.appId!!
+        rig.platform.prefs.putLong("lastHeartbeat.$appId", 0L)
+
+        val client = rig.launch()
+        client.setActive(true)                       // session.start at t0
+        rig.scheduler.advance(60.seconds)            // a ping at t60
+        rig.transport.script(503)
+        client.flush()                               // the server answered, so the ping is dropped
+
+        assertNull(
+            "nothing was ever acknowledged, so the key goes: a number from an unset clock must not " +
+                "outlive the launch that read it",
+            rig.platform.prefs.getLong("lastHeartbeat.$appId"),
+        )
+    }
+
+    /**
+     * Every ping refreshes the last-active stamp, so a process killed while still in the foreground
+     * leaves a recent one behind. Without it the stamp is the last transition's, and an app left
+     * open and quiet for longer than `sessionTimeout` - a recipe on the counter, a long read, a
+     * paused video - then killed by the system reads as an absence on relaunch: one continuous
+     * visit filed as two sessions, inflating the session count and collapsing the average length on
+     * exactly the apps whose users stay longest.
+     */
+    @Test
+    fun `a ping keeps the session alive across a kill in the foreground`() {
+        val rig = Rig()
+        val first = rig.launch()
+        first.setActive(true)                        // session.start at t0
+        val visit = first.currentSessionId()
+        rig.scheduler.advance(6.minutes)             // open, quiet and pinging, past the 5-minute timeout
+        assertEquals("six quiet minutes, six pings", 6, first.pendingSignals().count { it == Signal.HEARTBEAT })
+        // Killed here, with no background transition: the last one was at t0.
+
+        rig.clock.advance(10.seconds)
+        val second = rig.launch()
+        assertEquals(
+            "the pings say someone was here ten seconds ago, so this is the same visit",
+            visit,
+            second.currentSessionId(),
+        )
+        val inherited = second.pendingSignals().count { it == Signal.SESSION_START }
+        second.setActive(true)
+        rig.scheduler.settle()
+        assertEquals(
+            "and the relaunch opens no second session",
+            inherited,
+            second.pendingSignals().count { it == Signal.SESSION_START },
+        )
+    }
+
+    /**
+     * What the flush cadence costs a low-rate app, which is the shape most apps have. Below roughly
+     * two events a second `maxBatchSize` never fills, so the timer alone decides the request count:
+     * one request per interval for the whole visit, each carrying about as much HTTP head as
+     * payload, and each promoting the cellular radio in an SDK the end user did not choose to
+     * install. At a ten-second interval that is one request per event for an app doing six a
+     * minute. Leaving the foreground still sends everything at once, whatever the interval says.
+     */
+    @Test
+    fun `a low-rate visit costs one request per flush interval, not one per event`() {
+        assertEquals(
+            "the shipped default: three events to a request over a ten-minute visit",
+            21,
+            requestsForATenMinuteVisit(30.seconds),
+        )
+        assertEquals(
+            "at ten seconds the timer fires faster than the events arrive, so each one is its own request",
+            61,
+            requestsForATenMinuteVisit(10.seconds),
+        )
+    }
+
+    /** Ten minutes in the foreground at six events a minute; the number of requests it takes. */
+    private fun requestsForATenMinuteVisit(flushInterval: Duration): Int {
+        val rig = Rig()
+        val client = makeClient(
+            rig.platform,
+            rig.clock,
+            rig.scheduler,
+            rig.transport,
+            config = testConfiguration(
+                maxBatchSize = 20,                       // the shipped default, which never fills here
+                flushInterval = flushInterval,
+                heartbeatInterval = 1.hours,             // presence pings are not what this measures
+            ),
+        )
+        client.setActive(true)
+        for (i in 0 until 60) {
+            rig.scheduler.advance(10.seconds)
+            client.track("e$i", null)
+        }
+        client.setActive(false)                          // leaving sends what is left, at once
+        assertTrue("everything reached the wire", client.pendingSignals().isEmpty())
+        return rig.transport.requestSizes().size
     }
 }

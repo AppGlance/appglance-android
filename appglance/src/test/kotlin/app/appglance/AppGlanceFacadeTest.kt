@@ -62,8 +62,9 @@ class AppGlanceFacadeTest {
         val events = client.pendingEvents()
         val expected = listOf(Signal.INSTALL, "early", Signal.IDENTIFY, "late", "screen.paywall")
         assertEquals(expected, events.map { it.signal })
-        // `install` is stamped with the configure moment; everything else with its own call time,
-        // so the calls made before configure legitimately predate it - and stay in call order.
+        // `install` is stamped with the earliest moment the SDK holds for this install, and
+        // everything else with its own call time, so the calls made before configure keep their
+        // own (earlier) times and stay in call order.
         val stamps = events.drop(1).map { it.clientTs }
         assertEquals("client timestamps are taken at call time, in order", stamps.sorted(), stamps)
         assertTrue(
@@ -73,6 +74,29 @@ class AppGlanceFacadeTest {
         assertEquals(mapOf("k" to "v"), events[3].metadata)
         assertEquals(app.packageName, client.appId)
         assertTrue(events.all { it.userId == events[0].userId })
+    }
+
+    /**
+     * A ContentProvider or a library initializer runs before `Application.onCreate` reaches
+     * `configure`, so an app can legitimately track before it configures. Those calls are held and
+     * replayed carrying the moment they were really made, and the platform's first-seen rollup
+     * takes the smallest timestamp an install ever sends: an `install` stamped with `configure`
+     * would date the install after an event that provably preceded it.
+     */
+    @Test
+    fun `install is stamped no later than the calls made before configure`() {
+        val start = 1_700_000_000_000L
+        var clock = start
+        AppGlance.now = { clock }
+        AppGlance.track("app.cold_start")                 // from an initializer that runs first
+        clock += 120                                      // configure lands 120 ms later
+        AppGlance.configure(app, config())
+        AppGlance.drain()
+
+        val events = assertNotNull(AppGlance.currentClientForTesting()).pendingEvents()
+        assertEquals(listOf(Signal.INSTALL, "app.cold_start"), events.map { it.signal })
+        assertEquals("the install is dated by the earliest moment the SDK holds for it", start, events[0].clientTs)
+        assertEquals(start, events[1].clientTs)
     }
 
     @Test

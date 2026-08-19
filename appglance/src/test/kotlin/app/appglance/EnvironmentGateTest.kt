@@ -181,4 +181,68 @@ class EnvironmentGateTest {
         c.flush()
         assertEquals(emptyList<String>(), lines)
     }
+
+    /**
+     * A launch that is deliberately excluded records nothing, and must write no session state
+     * either. The pre-minted id is written under its own key and stays there until a
+     * `session.start` adopts it, and a gated run never records one - nor does the consent-withdrawal
+     * branch remove the key. Worse, an unadopted id wins over the gap check by design, so the next
+     * launch that DOES collect adopts it: a real session filed under an identifier minted during a
+     * run the app asked to be left out of its numbers.
+     */
+    @Test
+    fun `a gated launch writes no session state for a later launch to adopt`() {
+        val platform = InMemoryPlatform()
+        val clock = FakeClock()
+        val scheduler = FakeScheduler(clock)
+        val appId = "app.appglance.test"
+
+        // An app waiting for consent, and a debuggable build: both record nothing, for different
+        // reasons, and neither may leave a session id behind.
+        for (config in listOf(
+            testConfiguration(isEnabled = false),
+            testConfiguration(enabledEnvironments = emptySet()),
+        )) {
+            val gated = makeClient(platform, clock, scheduler, RecordingTransport(), config)
+            assertNull("a gated client has no session of its own", gated.currentSessionId())
+            assertNull(
+                "and left nothing on disk for the next launch to adopt",
+                platform.prefs.getString("session.pending.$appId"),
+            )
+            gated.setActive(true)
+            assertEquals(emptyList<String>(), gated.pendingSignals())
+            assertNull(platform.prefs.getString("session.pending.$appId"))
+            gated.shutdown()
+        }
+
+        // Consent granted: this launch mints its own id, and it is this launch's.
+        val collecting = makeClient(platform, clock, scheduler, RecordingTransport(), testConfiguration())
+        assertNotNull(collecting.currentSessionId())
+        assertEquals(
+            "the id it uses is the one it just wrote down",
+            collecting.currentSessionId(),
+            platform.prefs.getString("session.pending.$appId"),
+        )
+    }
+
+    /**
+     * The reported foreground state is recorded ahead of every guard, including the ones that drop
+     * the report, because it is the only thing a replacement client can be told the foreground
+     * state with. An app configured with `isEnabled = false` while it waits for consent is in front
+     * of the user; the lifecycle bridge reports it; the gate drops the report. When consent is
+     * granted and the app calls `configure` again, the replacement has nothing else to learn it
+     * from - `ProcessLifecycleOwner` replays the lifecycle only to a newly added observer.
+     */
+    @Test
+    fun `a gated client still remembers the foreground state for its replacement`() {
+        val gated = client(AppEnvironment.PRODUCTION, testConfiguration(isEnabled = false))
+        assertNull("nothing has reported one yet", gated.reportedForegroundState())
+
+        gated.setActive(true)
+        assertEquals("the report is dropped, but not forgotten", true, gated.reportedForegroundState())
+        assertEquals("dropped: a gated client records nothing", emptyList<String>(), gated.pendingSignals())
+
+        gated.setActive(false)
+        assertEquals(false, gated.reportedForegroundState())
+    }
 }

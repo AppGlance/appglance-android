@@ -55,6 +55,13 @@ class LifecycleSourceTest {
     @Before
     fun fresh() {
         AppGlance.resetForTesting()
+        // `ProcessLifecycleOwner` is a process singleton and Robolectric gives this module one
+        // sandbox, so every test class here shares the registry - and nothing can put it back:
+        // the lowest an ON_STOP reaches is CREATED, so once any class has driven it, INITIALIZED
+        // is gone for the rest of the run. That state is this class's whole premise, and class
+        // order is not fixed, so it is restored here rather than assumed. Safe with no observers
+        // attached, which the reset above guarantees by detaching the bridge.
+        registry.currentState = Lifecycle.State.INITIALIZED
         AppGlance.transportFactory = { transport }
         AppGlance.now = { clock }
         previousSink = Log.sink

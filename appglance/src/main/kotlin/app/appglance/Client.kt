@@ -48,6 +48,12 @@ internal class Client(
     /** The slice currently on the wire. See [persistLocked]. */
     private var inFlightBatch: List<Event> = emptyList()
 
+    /**
+     * The queue file as this client last left it; see [persistLocked]. Guarded by [queueLock],
+     * like the queue itself.
+     */
+    private var lastWrittenQueueJson: String? = null
+
     /** Set by [shutdown] once a later `configure` has replaced this client. */
     @Volatile
     private var retired = false
@@ -55,6 +61,11 @@ internal class Client(
     private var flushTask: Runnable? = null
     private var heartbeatTask: Runnable? = null
     private val drainPending = AtomicBoolean(false)
+    /**
+     * Set by [flush], read and cleared by the drain that acts on it: the developer's own "now"
+     * travels with the request as far as [drain], which is where the backoff is read.
+     */
+    private val drainUnthrottled = AtomicBoolean(false)
 
     // Automatic-retry backoff. Written by the send loop, read by the triggers on the command
     // thread, hence under [queueLock]. See [backOff].
@@ -69,6 +80,13 @@ internal class Client(
     // there (see [premintSessionIdIfNeeded]), so `install` and everything else recorded before
     // the first foreground carry the id `session.start` will carry.
     private var isActive = false
+    /**
+     * The last foreground state anybody reported, whether or not this client acted on it; null
+     * until something reports one. [isActive] cannot answer that question: it is what this client
+     * did, and a client built by a second `configure` starts inactive with the app already in
+     * front of the user. See [reportedForegroundState].
+     */
+    private var reportedActive: Boolean? = null
     private var lastActiveAt: Long? = null
     private var lastHeartbeatAt: Long? = null
     /**
@@ -106,11 +124,28 @@ internal class Client(
     private val sessionKey = "session.$appId"
     private val pendingSessionKey = "session.pending.$appId"
 
-    // User properties. The last snapshot the server has is mirrored here, so `identify` with the
-    // same values on every launch sends nothing; only a change costs an event.
+    // User properties. [traits] is the snapshot the server has ACKNOWLEDGED: it moves only when a
+    // batch carrying the `user.identify` (or `user.reset`) that changed it comes back accepted, so
+    // `identify` with the same values on every launch stays free while what it recorded is really
+    // stored, and starts sending again the moment a carrying event is lost. What an event still
+    // owed will leave the server with is read from the queue instead of being kept beside this,
+    // because the queue is the one place that knows whether that event still exists: a trim, a
+    // permanent 4xx, a deleted queue file and a relaunch all move it, and a second copy of the
+    // answer would disagree with the first. See [pendingTraits].
     private var traits: Map<String, String>
     private val traitsKey = "traits.$appId"
 
+    /**
+     * Set while this install still owes its `install` event, and cleared the moment the event is
+     * queued. The launch that mints the install id is not always one that can record: the
+     * environment gate excludes debuggable builds and emulators by default, and an app waiting for
+     * consent configures with `isEnabled = false`, so [track] is a no-op on both. [isNewInstall] is
+     * true on that one launch only, so without a note on disk the event is owed by a launch that is
+     * already over and is lost for the life of the install. Nothing written means nothing owed,
+     * which is how an install whose storage carries no marker reads: it was counted on the launch
+     * that minted its id.
+     */
+    private val installPendingKey = "install.pending.$appId"
     private var installRecorded = false
 
     init {
@@ -124,21 +159,22 @@ internal class Client(
         // in the dashboard stays empty however often the app calls `identify`. A genuinely new
         // install has nothing here to clear, so this costs it nothing.
         if (isNewInstall) forgetPersistedState()
-        prefs.getLong(lastActiveKey)?.let {
+        val bootTime = now()
+        restoredStamp(prefs.getLong(lastActiveKey), bootTime)?.let {
             lastActiveAt = it
             sessionId = prefs.getString(sessionKey)
         }
         // The ping stamp survives a relaunch for the same reason the session does: the interval is
         // a wall-clock promise, at most one presence ping per interval, and the server folds pings
         // into additive rollups that a doubled tick would inflate.
-        lastHeartbeatAt = prefs.getLong(lastHeartbeatKey)
+        lastHeartbeatAt = restoredStamp(prefs.getLong(lastHeartbeatKey), bootTime)
         // A ping an earlier process stamped is the best proof of delivery this one can have: the
         // queue file never holds a ping that was in flight, so there is nothing left to re-send
         // either way. A roll-back therefore undoes only this process's own unconfirmed pings.
         deliveredHeartbeatAt = lastHeartbeatAt
         // The event stamp comes back with it - it is the other half of the silence the interval
         // measures, and a resumed session records no event of its own to replace it.
-        lastEventAt = prefs.getLong(lastEventKey)
+        lastEventAt = restoredStamp(prefs.getLong(lastEventKey), bootTime)
         serverHeartbeatFloorMillis = prefs.getLong(heartbeatFloorKey)?.takeIf { isSaneHeartbeatFloorMillis(it) }
         premintSessionIdIfNeeded()
         traits = prefs.getString(traitsKey)?.let(::decodeTraits) ?: emptyMap()
@@ -154,15 +190,28 @@ internal class Client(
         // outage. A closed environment gate stops the queue being loaded; only a closed consent
         // switch destroys it.
         if (collecting) queueStore.load()?.let { queue.addAll(EventCoding.decode(it)) }
-        if (!config.isEnabled) queueStore.delete()
+        if (!config.isEnabled) {
+            queueStore.delete()
+            // The person goes with the events. `$email`, `$name` and `$id` are the only personal
+            // data the SDK puts on disk, they live in the same SharedPreferences, inside Auto
+            // Backup, and the one API that clears them, `reset()`, records nothing on a client
+            // that is not collecting - so an app that turns the switch off first can never reach
+            // them again. Keyed on `isEnabled` for the same reason the delete above is: a closed
+            // environment gate is not a withdrawal, and clearing on one would throw away the
+            // release build's record of what the server holds, from a build sharing its storage.
+            // The install id itself stays: turning collection back on has to be the same install,
+            // not a new one.
+            prefs.remove(traitsKey)
+            traits = emptyMap()
+        }
         announce()
     }
 
     /**
      * Drops every persisted trace of an install that is not this one: the session and its pending
-     * id, the presence stamps, the server's cadence floor and the user properties. The queue file
-     * is not among them - it lives outside the backup set and so never arrives on a second device
-     * in the first place.
+     * id, the presence stamps, the server's cadence floor, an `install` another install still owed
+     * and the user properties. The queue file is not among them - it lives outside the backup set
+     * and so never arrives on a second device in the first place.
      */
     private fun forgetPersistedState() {
         val keys = listOf(
@@ -172,6 +221,7 @@ internal class Client(
             heartbeatFloorKey,
             sessionKey,
             pendingSessionKey,
+            installPendingKey,
             traitsKey,
         )
         for (key in keys) prefs.remove(key)
@@ -220,10 +270,30 @@ internal class Client(
 
     // region Commands (called by the facade)
 
-    /** Records `install`, exactly once per install, ahead of everything else. */
+    /**
+     * Records `install`, exactly once per install, ahead of everything else.
+     *
+     * A launch that mints the install id and cannot record writes the debt down instead, and the
+     * first launch that is collecting pays it, stamped with its own `configure`: the moment this
+     * install can first be counted, and the moment the rest of that first batch belongs to. An
+     * older stamp would date the install to a run the app asked to be left out of its numbers.
+     * Only a launch that mints the id ever writes the marker, so a debuggable build run over an
+     * installed release copy leaves nothing behind and no install is ever recorded twice.
+     */
     fun recordInstallIfNeeded() {
-        if (!isNewInstall || installRecorded) return
+        if (installRecorded || retired) return
+        val owed = prefs.getBoolean(installPendingKey)
+        if (!isNewInstall && !owed) return
+        if (!collecting) {
+            // The facade asks again on every command; write only what is not already there.
+            if (!owed) prefs.putBoolean(installPendingKey, true)
+            return
+        }
         installRecorded = true
+        // Cleared before the event is queued, as the pre-minted session id's marker is: a death in
+        // between costs this install its `install`, where clearing it afterwards would record a
+        // second one on the next launch. One uncounted install beats one counted twice.
+        prefs.remove(installPendingKey)
         track(Signal.INSTALL, null, installAt)
     }
 
@@ -292,14 +362,19 @@ internal class Client(
      * change is sent - as `user.identify` whose metadata is the whole merged set, so the server
      * stores it as-is. Keys are clamped to 40 characters and values to 200, the limits the ingest
      * API applies, so what the SDK remembers is exactly what the server stored.
+     *
+     * "A change" is measured against what the server will hold once everything already owed has
+     * landed, not against what it holds now: an identify made while an earlier one is still queued
+     * or on the wire merges on top of that one and never re-sends it.
      */
     fun identify(patch: Map<String, String>, at: Long? = null) {
         if (!collecting || retired) return
-        val merged = LinkedHashMap(traits)
+        val known = pendingTraits() ?: traits
+        val merged = LinkedHashMap(known)
         for ((key, value) in patch) {
-            val k = key.trim().take(MAX_TRAIT_KEY_LENGTH)
+            val k = clamped(key, MAX_TRAIT_KEY_LENGTH)
             if (k.isEmpty()) continue
-            val v = value.trim().take(MAX_TRAIT_VALUE_LENGTH)
+            val v = clamped(value, MAX_TRAIT_VALUE_LENGTH)
             if (v.isEmpty()) merged.remove(k) else merged[k] = v
         }
         // The ingest API keeps at most 20 metadata keys per event; beyond that the extra
@@ -313,18 +388,26 @@ internal class Client(
         } else {
             merged
         }
-        if (capped == traits) return
-        traits = capped
-        persistTraits()
+        // The acknowledged snapshot is deliberately not touched here: it names what the server
+        // has, and this call's event has not been sent yet, let alone accepted. It moves in
+        // [noteDeliveredTraits] and nowhere else.
+        if (capped == known) return
         track(Signal.IDENTIFY, capped, at)
     }
 
     /**
      * Forgets every property attached to this install (sign-out) and sends `user.reset` if there
      * was anything to forget. The install id itself is untouched.
+     *
+     * The stored snapshot is cleared here rather than when the `user.reset` lands, and this is the
+     * one place where clearing ahead of delivery is right. An empty snapshot suppresses nothing:
+     * every later `identify` sends its whole set whatever became of the reset, and each one
+     * replaces the stored set wholesale server-side. Holding the person's email and name on disk
+     * until the server acknowledged the sign-out would keep them exactly where the sign-out asked
+     * for them to be gone.
      */
     fun reset(at: Long? = null) {
-        if (!collecting || retired || traits.isEmpty()) return
+        if (!collecting || retired || (pendingTraits() ?: traits).isEmpty()) return
         traits = emptyMap()
         persistTraits()
         track(Signal.RESET, null, at)
@@ -337,20 +420,35 @@ internal class Client(
      * cold-launched or resumed; inactive stops the heartbeat and flushes.
      */
     fun setActive(active: Boolean, at: Long? = null) {
+        // Recorded ahead of every guard below, including the ones that drop the report: what the
+        // app said is worth keeping even when this client does nothing with it, because it is the
+        // only thing a replacement client can be told the foreground state with.
+        reportedActive = active
         if (!collecting || retired || active == isActive) return
         isActive = active
         val t = at ?: now()
         if (active) {
-            val last = lastActiveAt
-            val resumes = last != null && sessionId != null && !sessionIdPreminted &&
-                t - last <= config.sessionTimeout.inWholeMilliseconds
+            val resumes = sessionId != null && !sessionIdPreminted &&
+                millisSince(lastActiveAt, t) <= config.sessionTimeout.inWholeMilliseconds
             if (!resumes) {
-                // A pre-minted id (already on every event recorded since init) becomes the
-                // session's id, exactly once; without one this is an in-process new session (the
-                // app backgrounded past the timeout and came back) and the id is minted here.
-                if (!sessionIdPreminted) sessionId = UUID.randomUUID().toString()
-                sessionIdPreminted = false
-                prefs.remove(pendingSessionKey)
+                if (sessionIdPreminted) {
+                    // A pre-minted id (already on every event recorded since init) becomes the
+                    // session's id, exactly once. The marker clears before the event is queued, so
+                    // a death in between mints a fresh id rather than re-adopting one whose
+                    // `session.start` is already in the persisted queue.
+                    sessionIdPreminted = false
+                    prefs.remove(pendingSessionKey)
+                } else {
+                    // An in-process new session: the app backgrounded past the timeout and came
+                    // back. The id is written down before the event that carries it, as the
+                    // pre-minted one is, because `track` persists the queue: a death in between
+                    // would otherwise leave a `session.start` for an id nothing on disk names, and
+                    // the next launch inside the timeout would resume the id before it and file
+                    // the whole visit under a session it never opened.
+                    val minted = UUID.randomUUID().toString()
+                    sessionId = minted
+                    prefs.putString(sessionKey, minted)
+                }
                 track(Signal.SESSION_START, null, t)
             }
             rememberActive(t)
@@ -362,7 +460,7 @@ internal class Client(
             // dashboard ends where the visit actually ended rather than at the last thing that
             // happened to be sent. Free at a one-minute cadence (the stamp is never that old); one
             // extra ping per silent visit at the sparser cadences a plan may ask for.
-            if (t - (lastPresenceAt() ?: Long.MIN_VALUE) > CLOSING_TICK_AFTER_MILLIS) {
+            if (millisSince(lastPresenceAt(), t) > CLOSING_TICK_AFTER_MILLIS) {
                 stampHeartbeat(t)
                 track(Signal.HEARTBEAT, null, t)
                 log { "· closing presence ping (quiet for over a minute)" }
@@ -373,16 +471,24 @@ internal class Client(
     }
 
     /**
-     * Sends the queue now. Cancels the flush timer and asks the send loop to drain, joining a send
-     * already in progress rather than racing it: the slice is claimed out of the queue before the
-     * network call, so an overlapping flush never re-sends the same events.
+     * The foreground state last reported to this client, for the client that replaces it; null
+     * when nothing was ever reported. A second `configure` is the documented way to apply a
+     * consent change, and it can happen with the app in front of the user - on the settings screen
+     * the switch lives on. Nothing re-reports the state to the replacement: `ProcessLifecycleOwner`
+     * replays the lifecycle only to a newly added observer, and an app that turns
+     * `trackAppLifecycle` off drives [setActive] from its own `onStart`, which has already been and
+     * gone. Left inactive for the rest of the visit, that client records no `session.start`, sends
+     * no presence ping and does not flush on the way to the background.
      */
-    fun flush() {
-        flushTask?.let(scheduler::cancel)
-        flushTask = null
-        if (!collecting || retired) return
-        requestDrain()
-    }
+    fun reportedForegroundState(): Boolean? = reportedActive
+
+    /**
+     * Sends the queue now, whatever the retry backoff says. Cancels the flush timer and asks the
+     * send loop to drain, joining a send already in progress rather than racing it: the slice is
+     * claimed out of the queue before the network call, so an overlapping flush never re-sends the
+     * same events.
+     */
+    fun flush() = requestDrain(unthrottled = true)
 
     // endregion
 
@@ -404,12 +510,20 @@ internal class Client(
      */
     private fun premintSessionIdIfNeeded() {
         if (!collecting) return   // a gated client records nothing and must not write state
-        val last = lastActiveAt
-        val resumes = last != null && sessionId != null && now() - last <= config.sessionTimeout.inWholeMilliseconds
-        if (resumes) return
-        sessionId = prefs.getString(pendingSessionKey) ?: UUID.randomUUID().toString().also {
-            prefs.putString(pendingSessionKey, it)
+        // The unadopted id is read before the gap is measured, and wins over it: an id sits under
+        // that key only because a process minted it, recorded events under it and died before any
+        // foreground, so those events are on disk carrying it and the session it belongs to has
+        // still never been opened. A stamp saying the last session is resumable cannot be true at
+        // the same moment, and when the two disagree - a clock corrected backwards under a stamp
+        // this install wrote - believing the stamp strands the id and every event under it in a
+        // session the server is never told about.
+        val unadopted = prefs.getString(pendingSessionKey)
+        if (unadopted == null) {
+            val resumes = sessionId != null &&
+                millisSince(lastActiveAt, now()) <= config.sessionTimeout.inWholeMilliseconds
+            if (resumes) return
         }
+        sessionId = unadopted ?: UUID.randomUUID().toString().also { prefs.putString(pendingSessionKey, it) }
         sessionIdPreminted = true
     }
 
@@ -448,11 +562,14 @@ internal class Client(
     /**
      * Milliseconds until the next ping is due: a full interval of silence after the last proof
      * of presence. Zero means now - including the case where nothing has been sent yet, such as
-     * a resumed session that started before this process.
+     * a resumed session that started before this process. Never more than one interval, whatever
+     * the stamps say: this number becomes the delay the whole presence loop is paced by, and a
+     * delay that outlives the visit is the same thing as no presence at all. Exposed for tests.
      */
-    private fun millisUntilNextHeartbeat(): Long {
-        val last = lastPresenceAt() ?: return 0L
-        return (heartbeatIntervalMillis() - (now() - last)).coerceAtLeast(0L)
+    internal fun millisUntilNextHeartbeat(): Long {
+        val silence = millisSince(lastPresenceAt(), now())
+        val interval = heartbeatIntervalMillis()
+        return if (silence >= interval) 0L else interval - silence
     }
 
     /**
@@ -574,6 +691,36 @@ internal class Client(
 
     private fun isSaneHeartbeatFloorMillis(millis: Long): Boolean = millis in 15_000L..3_600_000L
 
+    /**
+     * A persisted stamp, or null when the number on disk cannot be one: not after the epoch, or
+     * ahead of [t]. The presence stamps are this install's only record of when it was last heard
+     * from, and a device whose clock was hours ahead when they were written leaves every one of
+     * them in the future, where the silence they measure reads as negative and no ping is ever due
+     * again. They get the same treatment as the server's cadence floor above for the same reason:
+     * a value that cannot be true is worth less than no value at all. Discarding one costs this
+     * launch a ping it did not owe and a session boundary it did not need; keeping one costs every
+     * ping until the clock catches up, on this launch and on all the ones after it.
+     */
+    private fun restoredStamp(millis: Long?, t: Long): Long? =
+        if (millis == null || millis <= 0L || millis > t + CLOCK_SKEW_TOLERANCE_MILLIS) null else millis
+
+    /**
+     * How long ago [stamp] was, as of [t], when that is a duration worth acting on: [Long.MAX_VALUE]
+     * when there is no stamp at all, and when the stamp is ahead of [t] by more than
+     * [CLOCK_SKEW_TOLERANCE_MILLIS] - a clock corrected backwards under a stamp this process itself
+     * wrote, which no check at startup can see coming.
+     *
+     * Every question the SDK asks of a stamp - resume this session or start a new one, is a ping
+     * owed, does leaving deserve a closing tick - is safe when the answer is "a long time" and stuck
+     * when it is "not yet", so a gap that cannot be measured reads as unbounded.
+     */
+    private fun millisSince(stamp: Long?, t: Long): Long {
+        if (stamp == null) return Long.MAX_VALUE
+        val elapsed = t - stamp
+        if (elapsed < -CLOCK_SKEW_TOLERANCE_MILLIS) return Long.MAX_VALUE
+        return elapsed.coerceAtLeast(0L)
+    }
+
     // endregion
 
     // region Delivery
@@ -587,7 +734,7 @@ internal class Client(
      */
     private fun flushSoon() {
         val holdMillis = synchronized(queueLock) { nextAttemptAt - now() }
-        if (holdMillis <= 0) flush() else scheduleFlush(holdMillis)
+        if (holdMillis <= 0) requestDrain(unthrottled = false) else scheduleFlush(holdMillis)
     }
 
     private fun scheduleFlush(delayMillis: Long = config.flushInterval.inWholeMilliseconds) {
@@ -604,36 +751,67 @@ internal class Client(
     }
 
     /**
-     * At most one drain runs at a time (the executor is serial) and at most one more is queued
-     * behind it: a flush that arrives mid-send starts after the running one and finds whatever it
-     * left.
+     * Cancels the flush timer and asks the send loop to drain. At most one drain runs at a time
+     * (the executor is serial) and at most one more is queued behind it: a flush that arrives
+     * mid-send starts after the running one and finds whatever it left.
      */
-    private fun requestDrain() {
+    private fun requestDrain(unthrottled: Boolean) {
+        flushTask?.let(scheduler::cancel)
+        flushTask = null
+        if (!collecting || retired) return
+        if (unthrottled) drainUnthrottled.set(true)
         if (drainPending.compareAndSet(false, true)) sendExecutor.execute(::drain)
     }
 
     /**
-     * Sends the queue in request-sized slices, oldest first, until it is empty or the network says
-     * "later". Each slice is claimed out of the queue before the request, so events tracked
-     * meanwhile line up behind it.
+     * Sends the queue in request-sized slices, oldest first, until what it set out to send has
+     * gone or the network says "later". Each slice is claimed out of the queue before the request,
+     * so events tracked meanwhile line up behind it.
+     *
+     * What it sets out to send is what was owed when the delivery began, and that bound is what
+     * keeps a burst from leaving as roughly one request per event. The loop is fed by the same
+     * queue the app is writing to, so an app recording as fast as the network answers - a
+     * screenful of items, a replayed queue of user actions - would otherwise have every iteration
+     * after the first find exactly the one event tracked during the last round trip, and send it
+     * on its own: a full set of request headers and a round trip each. Anything tracked after the
+     * delivery began goes with the next delivery instead, the one [armNextDelivery] asks for.
      */
     private fun drain() {
         drainPending.set(false)
+        // The backoff is read where the send starts, not where it was asked for. A drain requested
+        // while a request is on the wire waits behind that request on the serial executor, and the
+        // request it is waiting for is what arms the backoff as it fails: an attempt decided in
+        // front of that answer is decided against a window nobody had asked for yet, so one outage
+        // counts as two consecutive failures and a server that has just asked for room is hit
+        // again with no delay. The flag is only cleared by a drain that really attempts, so an
+        // explicit flush arriving while this one defers is still honoured by the drain queued
+        // behind it.
+        if (!drainUnthrottled.get()) {
+            val holdMillis = synchronized(queueLock) { nextAttemptAt - now() }
+            if (holdMillis > 0) {
+                scheduler.post { if (!retired) scheduleFlush(holdMillis) }
+                return
+            }
+        }
+        drainUnthrottled.set(false)
         var slice = MAX_EVENTS_PER_REQUEST
-        while (true) {
+        var owed = synchronized(queueLock) { queue.size }
+        while (owed > 0) {
             val batch: List<Event> = synchronized(queueLock) {
-                if (!collecting || retired || queue.isEmpty()) return
-                val n = minOf(slice, queue.size)
+                if (!collecting || retired || queue.isEmpty()) return@synchronized emptyList()
+                val n = minOf(slice, minOf(owed, queue.size))
                 List(n) { queue.removeFirst() }.also {
                     inFlightBatch = it
                     persistLocked()
                 }
             }
+            if (batch.isEmpty()) break
             val count = "${batch.size} event${if (batch.size == 1) "" else "s"}"
             log { "↑ sending $count…" }
             val status = transport.send(EventCoding.encodeBytes(batch))
             when {
                 status in 200..299 -> {
+                    owed -= batch.size
                     synchronized(queueLock) {
                         inFlightBatch = emptyList()
                         failureStreak = 0
@@ -642,6 +820,8 @@ internal class Client(
                     }
                     log { "✓ sent $count" }
                     noteDeliveredHeartbeats(batch)
+                    // After the slice has left [inFlightBatch], so "still owed" means what it says.
+                    noteDeliveredTraits(batch, transport.lastAcceptedCount())
                     adoptHeartbeatFloor(transport.lastHeartbeatIntervalSeconds())
                 }
 
@@ -662,10 +842,19 @@ internal class Client(
                         else -> ""
                     }
                     log { "✕ HTTP $status - ${keyHint}a retry could never succeed, so this batch is dropped" }
+                    owed -= batch.size
                     synchronized(queueLock) {
                         inFlightBatch = emptyList()
                         persistLocked()
                     }
+                    // The pings in it go too, and they were never counted: the ingest rejects a
+                    // batch like this before it reads a row. Leaving their stamp in place spends a
+                    // whole fresh interval before the install proves presence again, which is the
+                    // silence [rollBackHeartbeatStamp] exists to prevent; this branch simply never
+                    // asked for it, because it drops the slice instead of putting it back.
+                    batch.filter { it.signal == Signal.HEARTBEAT }
+                        .maxOfOrNull { it.clientTs }
+                        ?.let { rollBackHeartbeatStamp(it) }
                 }
 
                 else -> {
@@ -673,27 +862,58 @@ internal class Client(
                     val why = if (status < 0) "no response" else "HTTP $status"
                     log { "⟳ couldn't send ($why) - keeping $count for the next try" }
                     requeue(batch, keepingHeartbeats = status == Transport.NEVER_CONNECTED)
-                    backOff(retryAfterSeconds = if (status == 429) transport.lastRetryAfterSeconds() else null)
+                    // Whatever the status stated it. A maintenance window or a load shed answers
+                    // 503 and says how long to stay away, which is the case the header exists for;
+                    // 429 is the narrower one where this install alone is being throttled. The
+                    // transport reports the header only for an answer it actually read, so a
+                    // request that never reached a server states nothing. [flush] and the flush on
+                    // the way to the background ignore the window, so a header cannot silence an
+                    // install however it is set.
+                    val holdMillis = backOff(retryAfterSeconds = transport.lastRetryAfterSeconds())
+                    // The retry is armed here rather than left to whatever the app does next:
+                    // [requestDrain] cancelled the flush timer on the way in, and the batch-size
+                    // trigger asks for one delivery at a time, so an app that goes quiet after a
+                    // burst would otherwise sit on a full queue until something else happened
+                    // to it.
+                    armNextDelivery(holdMillis)
                     return
                 }
             }
         }
+        armNextDelivery()
     }
 
     /**
-     * Arms the automatic-retry throttle after a retryable failure. The next automatic drain waits
-     * `min(60 s, 2^failures seconds)`, jittered into the upper half of that window so clients that
-     * failed together do not all retry together, and never less than the server's own numeric
-     * `Retry-After` on a 429, which is itself clamped (see [obeyableRetryAfterMillis]). A
-     * successful send clears it; [flush] ignores it (see [flushSoon]).
+     * Arms the flush timer for whatever a delivery left behind: the slices its bound did not
+     * reach, and the batch a retryable failure handed back. [requestDrain] cancels the timer on
+     * the way in and the batch-size trigger asks for one delivery at a time, so what is left has
+     * no trigger of its own until the app records something else, which an app that has just gone
+     * quiet does not.
+     *
+     * The hop onto the scheduler is what makes this safe to call from the send loop: [flushTask]
+     * belongs to the command thread. A timer is already armed here as often as not, and
+     * [scheduleFlush] makes that a no-op.
      */
-    private fun backOff(retryAfterSeconds: Long?) {
-        synchronized(queueLock) {
-            failureStreak++
-            val base = minOf(MAX_BACKOFF_MILLIS, (1L shl minOf(failureStreak, 6)) * 1_000L)
-            val jittered = base / 2 + (random() * (base / 2)).toLong()
-            nextAttemptAt = now() + maxOf(jittered, obeyableRetryAfterMillis(retryAfterSeconds))
-        }
+    private fun armNextDelivery(delayMillis: Long = config.flushInterval.inWholeMilliseconds) {
+        if (synchronized(queueLock) { queue.isEmpty() }) return
+        scheduler.post { if (!retired) scheduleFlush(delayMillis) }
+    }
+
+    /**
+     * Arms the automatic-retry throttle after a retryable failure and answers the window it armed.
+     * The next automatic drain waits `min(60 s, 2^failures seconds)`, jittered into the upper half
+     * of that window so clients that failed together do not all retry together, and never less
+     * than the server's own numeric `Retry-After`, which is itself clamped (see
+     * [obeyableRetryAfterMillis]). A successful send clears it; [flush] ignores it (see
+     * [flushSoon]).
+     */
+    private fun backOff(retryAfterSeconds: Long?): Long = synchronized(queueLock) {
+        failureStreak++
+        val base = minOf(MAX_BACKOFF_MILLIS, (1L shl minOf(failureStreak, 6)) * 1_000L)
+        val jittered = base / 2 + (random() * (base / 2)).toLong()
+        val holdMillis = maxOf(jittered, obeyableRetryAfterMillis(retryAfterSeconds))
+        nextAttemptAt = now() + holdMillis
+        holdMillis
     }
 
     /**
@@ -733,20 +953,76 @@ internal class Client(
      * events. If the process is killed before the response arrives, the next launch re-sends those
      * (the server ignores replays by event id) and never the heartbeats, which may already have
      * been counted. Refused once retired, so a replaced client cannot clobber the file.
+     *
+     * A write whose bytes match the last one this client landed is skipped. Several of the calls
+     * here cannot change what is owed at all: claiming a slice with no presence ping in it moves
+     * events from [queue] into [inFlightBatch], and the union of the two is what gets written, so
+     * the file comes out exactly what it already was; putting that same slice back after a
+     * transient failure moves them again, for the same answer. Each of those pays a full atomic
+     * rewrite, which costs the same for four hundred bytes as for two hundred kilobytes, because
+     * what it buys is filesystem metadata rather than throughput. Claiming a slice that DOES carry
+     * a ping is a change, and that write is the one that takes the ping off disk, so it always
+     * happens. Only this client writes the file while it lives - init reads it, [shutdown] retires
+     * it, and a replacement is built only after that - so the record cannot go stale underneath it.
      */
     private fun persistLocked() {
         if (retired) return
         val owed = inFlightBatch.filter { it.signal != Signal.HEARTBEAT } + queue
-        try {
-            queueStore.save(EventCoding.encode(owed))
+        val json = EventCoding.encode(owed)
+        // The file is confirmed to still be there before anything is skipped, so a skip can never
+        // be measured against a file that has gone.
+        if (json == lastWrittenQueueJson && queueStore.exists()) return
+        // The record is the bytes that LANDED, not the bytes that were offered: a store that
+        // reports failure, or throws, leaves it cleared, so the next identical write repairs the
+        // file instead of being skipped against one that never received it.
+        lastWrittenQueueJson = try {
+            if (queueStore.save(json)) json else null
         } catch (_: Exception) {
             // Best effort: a full disk must not take the app down with it.
+            null
         }
     }
 
     // endregion
 
     // region User properties persistence
+
+    /**
+     * The set the newest `user.identify` or `user.reset` still owed - queued or on the wire - will
+     * leave the server with once it lands; null when nothing is owed, in which case [traits] is
+     * the whole truth. A `user.reset` owes the empty map, which is not the same answer as null.
+     */
+    private fun pendingTraits(): Map<String, String>? =
+        synchronized(queueLock) { outstandingTraits(inFlightBatch + queue) }
+
+    /**
+     * Commits the snapshot a batch the server accepted has just left it holding. The only place
+     * [traits] moves forward: what `identify` recorded is not what the server has until a batch
+     * carrying it comes back accepted, and every way that event can die - the queue cap trimming
+     * the oldest, a permanent 4xx dropping the slice, the file being deleted - then leaves the
+     * snapshot where it was, so the next `identify` sends again instead of matching a cache the
+     * server never received.
+     *
+     * `accepted` is the ingest's own count of the rows it took. A 2xx alone is not proof that they
+     * were stored: past the plan's grace ceiling, and under the per-install rate limiter, the
+     * answer is still 202 and the identify is discarded. A batch counted short of what was sent
+     * commits nothing. Null is "the answer said nothing about it", not "none".
+     *
+     * Nothing is committed while a NEWER identify or reset is still owed either: what the server
+     * holds now is already superseded, and re-persisting it would put properties a sign-out has
+     * just cleared back on disk. That one commits when its own batch lands.
+     *
+     * Called from the send loop, so the commit hops back to the thread that owns [traits].
+     */
+    private fun noteDeliveredTraits(batch: List<Event>, accepted: Int?) {
+        if (accepted != null && accepted < batch.size) return
+        val delivered = outstandingTraits(batch) ?: return
+        scheduler.post {
+            if (retired || pendingTraits() != null || delivered == traits) return@post
+            traits = delivered
+            persistTraits()
+        }
+    }
 
     private fun persistTraits() {
         if (traits.isEmpty()) prefs.remove(traitsKey) else prefs.putString(traitsKey, encodeTraits(traits))
@@ -762,8 +1038,14 @@ internal class Client(
     /** The queued events themselves, in order. */
     fun pendingEvents(): List<Event> = synchronized(queueLock) { queue.toList() }
 
-    /** The user properties as the SDK believes the server has them. */
-    fun currentTraits(): Map<String, String> = traits
+    /**
+     * The user properties as they stand: what an identify or reset still owed will leave the
+     * server with, or the acknowledged snapshot when nothing is owed.
+     */
+    fun currentTraits(): Map<String, String> = pendingTraits() ?: traits
+
+    /** The snapshot the server has acknowledged. */
+    fun deliveredTraits(): Map<String, String> = traits
 
     /**
      * The session id every recorded event is stamped with: pre-minted at init when a new session
@@ -805,6 +1087,16 @@ internal class Client(
         const val MIN_HEARTBEAT_RETRY_MILLIS: Long = 15_000L
 
         /**
+         * How far ahead of the clock a stamp may be and still be read as "now": the finest presence
+         * resolution anything here has (`heartbeatInterval`'s floor, and [MIN_HEARTBEAT_RETRY_MILLIS]).
+         * Below it a skew is the distance between two clock reads - the facade stamps a call, the
+         * client applies it, a time server nudges the clock a fraction of a second - and changes
+         * nothing anybody sees. Above it, a stamp in the future is a clock that was wrong when it
+         * was written.
+         */
+        const val CLOCK_SKEW_TOLERANCE_MILLIS: Long = 15_000L
+
+        /**
          * Events per request. The ingest API accepts up to 500 events / 256 KB per batch; a
          * long-offline queue drains in slices this size rather than as one oversized POST.
          */
@@ -815,10 +1107,37 @@ internal class Client(
         const val MAX_TRAIT_VALUE_LENGTH: Int = 200
 
         /**
+         * Trimmed, then cut to [max] UTF-16 code units - the unit the ingest counts in, and the
+         * unit `String.length` and `take` already work in, so the two agree on where the cut
+         * falls. A cut that lands between the two halves of a surrogate pair is the one place they
+         * do not: what is left ends in a lone high surrogate, which the ingest strips and which
+         * UTF-8 encoding turns into `?` on the way out of here anyway, so the server can only
+         * store something the SDK does not have. The snapshot would then never match, and since
+         * only a change is sent, no later `identify` with the same values could correct it. The
+         * orphaned half goes instead.
+         */
+        fun clamped(value: String, max: Int): String {
+            val trimmed = value.trim()
+            if (trimmed.length <= max) return trimmed
+            val kept = trimmed.substring(0, max)
+            return if (kept.last().isHighSurrogate()) kept.dropLast(1) else kept
+        }
+
+        /**
          * Client errors that mean "this batch will never be accepted as is". 408 (timeout), 425
          * (too early) and 429 (rate limited) are the 4xx that do deserve a retry.
          */
         fun isPermanent(status: Int): Boolean = status in 400..499 && status !in setOf(408, 425, 429)
+
+        /**
+         * What the server ends up holding once every identify and reset in [owed] has landed: the
+         * last one wins, exactly as it does server-side, where each `user.identify` replaces the
+         * stored set wholesale and `user.reset` deletes it. Null when [owed] carries neither.
+         */
+        fun outstandingTraits(owed: List<Event>): Map<String, String>? {
+            val last = owed.lastOrNull { it.signal == Signal.IDENTIFY || it.signal == Signal.RESET } ?: return null
+            return if (last.signal == Signal.RESET) emptyMap() else (last.metadata ?: emptyMap())
+        }
 
         fun encodeTraits(traits: Map<String, String>): String {
             val o = JSONObject()

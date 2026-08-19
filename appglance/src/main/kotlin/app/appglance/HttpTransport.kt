@@ -26,9 +26,16 @@ internal class HttpTransport(
 
     override fun lastHeartbeatIntervalSeconds(): Long? = heartbeatIntervalSeconds
 
+    /** See [Transport.lastAcceptedCount]; refreshed on every 2xx, cleared otherwise. */
+    @Volatile
+    private var acceptedCount: Int? = null
+
+    override fun lastAcceptedCount(): Int? = acceptedCount
+
     override fun send(body: ByteArray): Int {
         retryAfterSeconds = null
         heartbeatIntervalSeconds = null
+        acceptedCount = null
         val connection = try {
             URL(endpoint).openConnection() as HttpURLConnection
         } catch (_: Exception) {
@@ -58,15 +65,18 @@ internal class HttpTransport(
             val status = connection.responseCode
             // Only the numeric form; an HTTP-date here is vanishingly rare and not worth a parser.
             retryAfterSeconds = connection.getHeaderField("Retry-After")?.trim()?.toLongOrNull()?.takeIf { it >= 0 }
-            // Read the body (so the connection can be reused) and, on a 2xx, keep the one field
+            // Read the body (so the connection can be reused) and, on a 2xx, keep the two fields
             // the client cares about: the ingest answers `{"accepted": n, ...}` and may add
             // `heartbeat_interval` (seconds). A pattern match rather than a JSON parser: the SDK
-            // carries no JSON dependency, the field is a bare integer, and anything else in the
-            // body is simply not a hint - the batch was accepted either way.
+            // carries no JSON dependency, both fields are bare integers, and a body carrying
+            // neither is simply not a hint - the batch was accepted either way.
             try {
                 (if (status >= 400) connection.errorStream else connection.inputStream)?.use { stream ->
                     val text = String(stream.readBytes(), Charsets.UTF_8)
-                    if (status in 200..299) heartbeatIntervalSeconds = heartbeatIntervalIn(text)
+                    if (status in 200..299) {
+                        heartbeatIntervalSeconds = heartbeatIntervalIn(text)
+                        acceptedCount = acceptedIn(text)
+                    }
                 }
             } catch (_: IOException) {
                 // The status is what matters.
@@ -85,9 +95,13 @@ internal class HttpTransport(
 
     internal companion object {
         private val HEARTBEAT_INTERVAL = Regex(""""heartbeat_interval"\s*:\s*"?(\d+)""")
+        private val ACCEPTED = Regex(""""accepted"\s*:\s*"?(\d+)""")
 
         /** `heartbeat_interval` from an ingest response body, if it carries one. */
         internal fun heartbeatIntervalIn(body: String): Long? =
             HEARTBEAT_INTERVAL.find(body)?.groupValues?.get(1)?.toLongOrNull()
+
+        /** `accepted` from an ingest response body, if it carries one. */
+        internal fun acceptedIn(body: String): Int? = ACCEPTED.find(body)?.groupValues?.get(1)?.toIntOrNull()
     }
 }

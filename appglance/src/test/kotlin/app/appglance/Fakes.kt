@@ -2,6 +2,7 @@ package app.appglance
 
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
@@ -86,6 +87,12 @@ internal class RecordingTransport : Transport {
     /** When set, counted down as a send begins. */
     @Volatile var arrived: CountDownLatch? = null
 
+    /**
+     * Run as a send begins, before the answer: the seam for whatever a real request's time on the
+     * wire lets happen while the client believes a batch is still out.
+     */
+    @Volatile var onSend: () -> Unit = {}
+
     /** When set, no connection is ever established. */
     @Volatile var offline = false
 
@@ -98,6 +105,15 @@ internal class RecordingTransport : Transport {
     @Volatile var heartbeatIntervalSeconds: Long? = null
 
     override fun lastHeartbeatIntervalSeconds(): Long? = heartbeatIntervalSeconds
+
+    /**
+     * When set, reported as the `accepted` count of every 2xx response body - the ingest saying it
+     * took fewer rows than were sent, which is what an account past its grace ceiling gets. Null
+     * (the default) is an answer that says nothing about it.
+     */
+    @Volatile var acceptedCount: Int? = null
+
+    override fun lastAcceptedCount(): Int? = acceptedCount
 
     fun script(vararg s: Int) = synchronized(lock) {
         statuses.clear()
@@ -113,6 +129,7 @@ internal class RecordingTransport : Transport {
     fun batches(): List<List<Event>> = synchronized(lock) { received.toList() }
 
     override fun send(body: ByteArray): Int {
+        onSend()
         arrived?.countDown()
         gate?.await()
         val batch = EventCoding.decode(String(body, Charsets.UTF_8))
@@ -132,7 +149,12 @@ internal class RecordingTransport : Transport {
     }
 }
 
-internal class InMemoryIdentityStore(initial: String? = null, private val locked: Boolean = false) : IdentityStore {
+internal class InMemoryIdentityStore(
+    initial: String? = null,
+    private val locked: Boolean = false,
+    /** A store that keeps nothing and says so: a device whose data partition is full. */
+    private val dropsWrites: Boolean = false,
+) : IdentityStore {
     var value: String? = initial
 
     override fun lookup(): IdentityLookup = when {
@@ -141,8 +163,33 @@ internal class InMemoryIdentityStore(initial: String? = null, private val locked
         else -> IdentityLookup.Absent
     }
 
-    override fun save(id: String) {
+    override fun save(id: String): Boolean {
+        if (dropsWrites) return false
         value = id
+        return true
+    }
+}
+
+/**
+ * A store whose write reports success and whose next read does not hand the id back. The Direct
+ * Boot window is the concrete case: the write is unchecked and the read is unlock-checked, so the
+ * two disagree until the device is unlocked. `save` returning true is therefore not on its own
+ * proof that the next launch will find the id.
+ */
+internal class UnkeptIdentityStore(
+    /** What `lookup` answers once the write has reported success; null is "still nothing there". */
+    private val readsBackAfterSave: String? = null,
+) : IdentityStore {
+    private var written = false
+
+    override fun lookup(): IdentityLookup = when {
+        !written || readsBackAfterSave == null -> IdentityLookup.Absent
+        else -> IdentityLookup.Found(readsBackAfterSave)
+    }
+
+    override fun save(id: String): Boolean {
+        written = true
+        return true
     }
 }
 
@@ -161,6 +208,12 @@ internal class InMemoryKeyValueStore : KeyValueStore {
         map[key] = value
     }
 
+    override fun getBoolean(key: String): Boolean = map[key] as? Boolean ?: false
+
+    override fun putBoolean(key: String, value: Boolean) {
+        map[key] = value
+    }
+
     override fun remove(key: String) {
         map.remove(key)
     }
@@ -170,12 +223,23 @@ internal class InMemoryQueueStore : QueueStore {
     @Volatile var json: String? = null
     var writes = 0
 
+    /** Called as each write happens, for a test that asks what else was already on disk by then. */
+    @Volatile var onSave: (String) -> Unit = {}
+
+    /** When true the store reports every write as failed and keeps what it already held. */
+    @Volatile var failWrites = false
+
     override fun load(): String? = json
 
-    override fun save(json: String) {
-        this.json = json
+    override fun save(json: String): Boolean {
         writes++
+        if (failWrites) return false
+        this.json = json
+        onSave(json)
+        return true
     }
+
+    override fun exists(): Boolean = json != null
 
     override fun delete() {
         json = null
@@ -210,6 +274,18 @@ internal class InMemoryPlatform(
     override val prefs = InMemoryKeyValueStore()
     val queues = HashMap<String, InMemoryQueueStore>()
     override fun queueStore(appId: String): QueueStore = queues.getOrPut(appId) { InMemoryQueueStore() }
+}
+
+/** Counts what reaches the send executor: how many drains a burst of triggers really costs. */
+internal class CountingExecutor(private val delegate: Executor) : Executor {
+    private val count = AtomicInteger()
+
+    val submitted: Int get() = count.get()
+
+    override fun execute(command: Runnable) {
+        count.incrementAndGet()
+        delegate.execute(command)
+    }
 }
 
 /** Runs the send loop inline, on the caller's thread - deterministic and instant. */

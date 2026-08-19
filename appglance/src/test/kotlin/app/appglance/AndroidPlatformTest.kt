@@ -107,14 +107,36 @@ class AndroidPlatformTest {
         assertEquals("[{\"signal\":\"x\"}]", AndroidPlatform(app).queueStore("com.example.app/../weird id").load())
     }
 
+    /**
+     * The client skips a write whose bytes match the one it last landed, and asks the store whether
+     * the file is still there before it does. The production store is the one whose answer matters,
+     * so it is asked here rather than only the in-memory fake.
+     */
     @Test
-    fun `prefs store round-trips longs and strings and forgets on remove`() {
+    fun `the queue store reports whether the file is there`() {
+        val store = AndroidPlatform(app).queueStore("com.example.presence")
+        assertFalse("nothing written yet", store.exists())
+        store.save("[]")
+        assertTrue("written", store.exists())
+        store.delete()
+        assertFalse("withdrawn", store.exists())
+    }
+
+    @Test
+    fun `prefs store round-trips longs, strings and markers and forgets on remove`() {
         val prefs = AndroidPlatform(app).prefs
         assertNull(prefs.getLong("lastActive.a"))
         prefs.putLong("lastActive.a", 42L)
         prefs.putString("session.a", "s-1")
         assertEquals(42L, AndroidPlatform(app).prefs.getLong("lastActive.a"))
         assertEquals("s-1", prefs.getString("session.a"))
+        // A marker whose presence is the whole value: absent reads as false, which is what lets
+        // an install that owes nothing say so by writing nothing.
+        assertFalse("never written", prefs.getBoolean("install.pending.a"))
+        prefs.putBoolean("install.pending.a", true)
+        assertTrue(AndroidPlatform(app).prefs.getBoolean("install.pending.a"))
+        prefs.remove("install.pending.a")
+        assertFalse(prefs.getBoolean("install.pending.a"))
         prefs.remove("session.a")
         assertNull(prefs.getString("session.a"))
     }

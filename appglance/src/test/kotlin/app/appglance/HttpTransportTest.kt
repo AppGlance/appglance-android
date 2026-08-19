@@ -105,6 +105,26 @@ class HttpTransportTest {
         assertEquals(null, transport.lastRetryAfterSeconds())
     }
 
+    /**
+     * `accepted` is how the ingest says it took fewer rows than were sent - what an account past
+     * its grace ceiling gets with a 202 - so the client must be able to read it. A body that does
+     * not carry it says nothing about the batch, which is not the same as "none were taken".
+     */
+    @Test
+    fun `the accepted count is read from the response body when it carries one`() {
+        assertEquals(3, HttpTransport.acceptedIn("""{"accepted":3,"heartbeat_interval":240}"""))
+        assertEquals(0, HttpTransport.acceptedIn("""{"accepted": 0, "rejected": 2}"""))
+        assertEquals(null, HttpTransport.acceptedIn("{}"))
+
+        val transport = HttpTransport(endpoint, "k")
+        respondWith = 202
+        transport.send("[]".toByteArray())
+        assertEquals("the local server answers {\"accepted\":1}", 1, transport.lastAcceptedCount())
+        respondWith = 500
+        transport.send("[]".toByteArray())
+        assertEquals("and a failure leaves no stale count behind", null, transport.lastAcceptedCount())
+    }
+
     @Test
     fun `no server means no response, never an exception`() {
         val port = server.address.port

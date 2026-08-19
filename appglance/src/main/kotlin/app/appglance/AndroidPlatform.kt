@@ -83,13 +83,16 @@ internal class AndroidPlatform(
             }
         }
 
-        override fun save(id: String) {
+        override fun save(id: String): Boolean {
             // `commit`, not `apply`: this is written once per install and must be on disk before
-            // the `install` event that depends on it can possibly be sent.
+            // the `install` event that depends on it can possibly be sent. Its answer is the one
+            // thing that can tell a caller the id will not be there next launch - a full data
+            // partition is the case - because the value is served back out of the in-memory map
+            // whether or not it ever reached the file.
             val editor = sharedPreferences.edit().putString(KEY_INSTALL_ID, id)
             val marker = deviceMarker(context)
             if (marker == null) editor.remove(KEY_INSTALL_DEVICE) else editor.putString(KEY_INSTALL_DEVICE, marker)
-            editor.commit()
+            return editor.commit()
         }
 
         private fun userUnlocked(): Boolean {
@@ -113,6 +116,12 @@ internal class AndroidPlatform(
             sharedPreferences.edit().putString(key, value).apply()
         }
 
+        override fun getBoolean(key: String): Boolean = sharedPreferences.getBoolean(key, false)
+
+        override fun putBoolean(key: String, value: Boolean) {
+            sharedPreferences.edit().putBoolean(key, value).apply()
+        }
+
         override fun remove(key: String) {
             sharedPreferences.edit().remove(key).apply()
         }
@@ -130,18 +139,22 @@ internal class AndroidPlatform(
             }
         }
 
-        override fun save(json: String) {
+        override fun exists(): Boolean = file.exists()
+
+        override fun save(json: String): Boolean {
             file.parentFile?.mkdirs()
             val out = try {
                 atomic.startWrite()
             } catch (_: IOException) {
-                return
+                return false
             }
-            try {
+            return try {
                 out.write(json.toByteArray(Charsets.UTF_8))
                 atomic.finishWrite(out)
+                true
             } catch (_: IOException) {
                 atomic.failWrite(out)
+                false
             }
         }
 

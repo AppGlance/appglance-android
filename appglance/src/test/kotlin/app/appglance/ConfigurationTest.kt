@@ -61,9 +61,60 @@ class ConfigurationTest {
         assertEquals(300.seconds, config().sessionTimeout)
     }
 
+    /**
+     * The shipped defaults, pinned. `flushInterval` is the dial that decides how many requests a
+     * visit costs the end user's radio and cellular data - below roughly two events a second
+     * `maxBatchSize` never fills, so the timer alone sets the request count - and every app that
+     * never touches the knob gets whatever is here.
+     */
+    @Test
+    fun `the shipped defaults are the ones the README documents`() {
+        val defaults = AppGlance.Configuration(apiKey = "glance_live_test")
+        assertEquals(10.seconds, defaults.flushInterval)
+        assertEquals(20, defaults.maxBatchSize)
+        assertEquals(60.seconds, defaults.heartbeatInterval)
+        assertEquals(300.seconds, defaults.sessionTimeout)
+    }
+
     @Test
     fun `the defaults and the plain overload construct without complaint`() {
         AppGlance.Configuration(apiKey = "glance_live_test")
         AppGlance.Configuration(apiKey = "glance_live_test", debug = true)
+    }
+
+    /**
+     * The builder is what a Java caller has (see `JavaApiTest`): every knob it leaves alone must
+     * come out as the constructor's default, and the ones it sets must reach the same clamps.
+     */
+    @Test
+    fun `the builder carries the defaults and the clamps`() {
+        val plain = AppGlance.Configuration.Builder("glance_live_test").build()
+        val expected = AppGlance.Configuration(apiKey = "glance_live_test")
+        assertEquals(expected.endpoint, plain.endpoint)
+        assertEquals(expected.flushInterval, plain.flushInterval)
+        assertEquals(expected.maxBatchSize, plain.maxBatchSize)
+        assertEquals(expected.heartbeatInterval, plain.heartbeatInterval)
+        assertEquals(expected.sessionTimeout, plain.sessionTimeout)
+        assertEquals(expected.isEnabled, plain.isEnabled)
+        assertEquals(expected.collectsCountry, plain.collectsCountry)
+        assertEquals(expected.enabledEnvironments, plain.enabledEnvironments)
+        assertEquals(expected.trackAppLifecycle, plain.trackAppLifecycle)
+        assertEquals(expected.debug, plain.debug)
+
+        val set = AppGlance.Configuration.Builder("glance_live_test")
+            .heartbeatIntervalSeconds(120)
+            .sessionTimeoutSeconds(600)
+            .enabledEnvironments(setOf(AppEnvironment.PRODUCTION))
+            .debug(true)
+            .build()
+        assertEquals(120.seconds, set.heartbeatInterval)
+        assertEquals(600.seconds, set.sessionTimeout)
+        assertEquals(setOf(AppEnvironment.PRODUCTION), set.enabledEnvironments)
+        assertEquals(true, set.debug)
+        assertEquals(
+            "the clamps apply whichever way the configuration was built",
+            15.seconds,
+            AppGlance.Configuration.Builder("glance_live_test").heartbeatIntervalSeconds(0).build().heartbeatInterval,
+        )
     }
 }

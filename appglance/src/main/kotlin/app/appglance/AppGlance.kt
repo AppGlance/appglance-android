@@ -80,7 +80,13 @@ public object AppGlance {
         maxBatchSize: Int = 20,
         heartbeatInterval: Duration = 60.seconds,
         sessionTimeout: Duration = 5.minutes,
-        /** Master switch. `false` records and sends nothing (e.g. behind a user setting). Default true. */
+        /**
+         * Master switch. `false` records and sends nothing (e.g. behind a user setting). Default
+         * true. Turning it off also discards whatever an earlier run left queued on disk and the
+         * user properties `identify` stored, so a consent withdrawal takes effect for what was
+         * already recorded and not only for what comes next. The install id itself stays, so
+         * turning it back on is the same install rather than a new one.
+         */
         public val isEnabled: Boolean = true,
         /**
          * Attach the device's region setting (e.g. "US") to events - a locale, never GPS or IP, so
@@ -119,6 +125,84 @@ public object AppGlance {
          */
         public val debug: Boolean = false,
     ) {
+        /**
+         * Builds a [Configuration] from Java, where Kotlin's default arguments and
+         * `kotlin.time.Duration` are both out of reach: without it a Java-only app can reach the
+         * write key and [debug] through [AppGlance.configure] and nothing else - not
+         * [isEnabled], not [enabledEnvironments], not the intervals. Durations are whole seconds;
+         * every setter returns the builder; anything left alone keeps the default above.
+         *
+         * ```java
+         * AppGlance.configure(this, new AppGlance.Configuration.Builder("glance_live_…")
+         *     .enabledEnvironments(EnumSet.of(AppEnvironment.PRODUCTION))
+         *     .heartbeatIntervalSeconds(120)
+         *     .build());
+         * ```
+         *
+         * Kotlin has no use for it: call the constructor with named arguments.
+         */
+        public class Builder(private val apiKey: String) {
+            // The defaults live in the constructor above and are read back from it, so this class
+            // cannot drift from them.
+            private val defaults = Configuration(apiKey)
+            private var appId: String? = defaults.appId
+            private var endpoint: String = defaults.endpoint
+            private var appVersion: String? = defaults.appVersion
+            private var flushInterval: Duration = defaults.flushInterval
+            private var maxBatchSize: Int = defaults.maxBatchSize
+            private var heartbeatInterval: Duration = defaults.heartbeatInterval
+            private var sessionTimeout: Duration = defaults.sessionTimeout
+            private var isEnabled: Boolean = defaults.isEnabled
+            private var collectsCountry: Boolean = defaults.collectsCountry
+            private var enabledEnvironments: Set<AppEnvironment> = defaults.enabledEnvironments
+            private var environment: AppEnvironment? = defaults.environment
+            private var trackAppLifecycle: Boolean = defaults.trackAppLifecycle
+            private var debug: Boolean = defaults.debug
+
+            public fun appId(value: String?): Builder = apply { appId = value }
+
+            public fun endpoint(value: String): Builder = apply { endpoint = value }
+
+            public fun appVersion(value: String?): Builder = apply { appVersion = value }
+
+            public fun flushIntervalSeconds(value: Long): Builder = apply { flushInterval = value.seconds }
+
+            public fun maxBatchSize(value: Int): Builder = apply { maxBatchSize = value }
+
+            public fun heartbeatIntervalSeconds(value: Long): Builder = apply { heartbeatInterval = value.seconds }
+
+            public fun sessionTimeoutSeconds(value: Long): Builder = apply { sessionTimeout = value.seconds }
+
+            public fun isEnabled(value: Boolean): Builder = apply { isEnabled = value }
+
+            public fun collectsCountry(value: Boolean): Builder = apply { collectsCountry = value }
+
+            public fun enabledEnvironments(value: Set<AppEnvironment>): Builder = apply { enabledEnvironments = value }
+
+            public fun environment(value: AppEnvironment?): Builder = apply { environment = value }
+
+            public fun trackAppLifecycle(value: Boolean): Builder = apply { trackAppLifecycle = value }
+
+            public fun debug(value: Boolean): Builder = apply { debug = value }
+
+            public fun build(): Configuration = Configuration(
+                apiKey = apiKey,
+                appId = appId,
+                endpoint = endpoint,
+                appVersion = appVersion,
+                flushInterval = flushInterval,
+                maxBatchSize = maxBatchSize,
+                heartbeatInterval = heartbeatInterval,
+                sessionTimeout = sessionTimeout,
+                isEnabled = isEnabled,
+                collectsCountry = collectsCountry,
+                enabledEnvironments = enabledEnvironments,
+                environment = environment,
+                trackAppLifecycle = trackAppLifecycle,
+                debug = debug,
+            )
+        }
+
         // Every number below reaches arithmetic where an out-of-range value is a spin or a stall
         // inside somebody else's shipped app, which cannot be hot-fixed: `heartbeatInterval` paces
         // the presence loop, which only waits while the next ping is still in the future, so zero
@@ -376,18 +460,25 @@ public object AppGlance {
     // region The pump (command thread)
 
     private fun onConfigure(cmd: Command.Configure) {
+        // The foreground state travels with the swap. The replacement starts inactive, and nothing
+        // else will tell it otherwise while the app stays where it is: the lifecycle bridge hands
+        // over the start it can see (and repeating it here is free, since `setActive` is
+        // idempotent), but with `trackAppLifecycle` off there is no bridge at all and the app's own
+        // `onStart` has already been and gone.
+        val reported = client?.reportedForegroundState()
         client?.shutdown()
         client = null
         pending = cmd
         val started = startPendingIfPossible() ?: return   // id unreadable: hold commands until it isn't
         started.recordInstallIfNeeded()                    // `install` goes first, always
+        reported?.let { started.setActive(it, cmd.at) }
         replayWaiting(started)
     }
 
     /**
      * Builds the client from the pending configuration if the install id can be read now. `isNew`
-     * is true exactly once per install, and the client stamps `install` with the moment `configure`
-     * was called.
+     * is true exactly once per install, and the client stamps `install` with the earliest moment
+     * this SDK holds for that install.
      */
     private fun startPendingIfPossible(): Client? {
         client?.let { return it }
@@ -395,11 +486,17 @@ public object AppGlance {
         val platform = platformFactory(cmd.context)
         val identity = AnonymousIdentity.current(platform.identity) ?: return null   // Direct Boot, before unlock
         pending = null
+        // `install` is queued first and stamped earliest. A call an app makes from a
+        // ContentProvider or a library initializer runs before `Application.onCreate` reaches
+        // `configure`, and such a call is held and replayed carrying the moment it was really
+        // made: the platform's first-seen rollup takes the smallest timestamp an install ever
+        // sends, so stamping `install` with `configure` would date the install after an event
+        // that provably preceded it.
         return Client(
             config = cmd.configuration,
             userId = identity.id,
             isNewInstall = identity.isNew,
-            installAt = cmd.at,
+            installAt = minOf(cmd.at, earliestWaiting() ?: cmd.at),
             platform = platform,
             scheduler = scheduler,
             sendExecutor = sender,
@@ -407,6 +504,18 @@ public object AppGlance {
             now = now,
         ).also { client = it }
     }
+
+    /** The moment of the oldest call still waiting to be replayed, if any. */
+    private fun earliestWaiting(): Long? = waiting.mapNotNull { cmd ->
+        when (cmd) {
+            is Command.Configure -> cmd.at
+            is Command.Track -> cmd.at
+            is Command.Identify -> cmd.at
+            is Command.Reset -> cmd.at
+            is Command.SetActive -> cmd.at
+            Command.Flush -> null       // never buffered, and it carries no moment of its own
+        }
+    }.minOrNull()
 
     private fun dispatch(cmd: Command) {
         val c = startPendingIfPossible()

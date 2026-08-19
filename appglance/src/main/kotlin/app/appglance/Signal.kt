@@ -2,7 +2,11 @@ package app.appglance
 
 /** The signal names the SDK reserves. Anything else passed to [AppGlance.track] is yours. */
 public object Signal {
-    /** Recorded exactly once per install, on the launch that minted the install id. */
+    /**
+     * Recorded exactly once per install, on the first launch that collects: the launch that minted
+     * the install id, or, if the environment gate or `isEnabled` was closed then, the first launch
+     * after it that sends.
+     */
     public const val INSTALL: String = "install"
 
     /**
@@ -13,8 +17,9 @@ public object Signal {
     public const val SESSION_START: String = "session.start"
 
     /**
-     * The presence ping sent every `heartbeatInterval` while the app is in the foreground. Powers
-     * "active right now" and session length; never billable, never shown as an event.
+     * The presence ping, sent after `heartbeatInterval` in the foreground with nothing else sent: a
+     * real event proves presence exactly as a ping does, so an app that keeps tracking events never
+     * pings. Powers "active right now" and session length; never billable, never shown as an event.
      */
     public const val HEARTBEAT: String = "heartbeat"
 
