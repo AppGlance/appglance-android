@@ -6,7 +6,7 @@ All notable changes to the AppGlance Android SDK (`app.appglance:appglance`). Th
 [GitHub Release](https://github.com/AppGlance/appglance-android/releases) with the same notes.
 The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-apple/blob/main/CHANGELOG.md).
 
-## [Unreleased]
+## [1.2.1] - 2026-08-19
 
 ### Changed
 
@@ -20,6 +20,23 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
 
 ### Fixed
 
+- A queue the process was killed in the middle of writing is recovered instead of read as empty.
+  `AtomicFile` moves the previous copy to a `.bak` name for the length of a write and restores it
+  on the next read, so a kill between those two moments leaves the only good queue under that name
+  and nothing under the one the store looked for. The store answered from the base file's presence
+  alone and reported an empty queue in exactly the case the backup exists to survive, dropping
+  every event in it.
+- A queue write the device could not finish is no longer reported as landed. `AtomicFile.finishWrite`
+  logs a failure to close and swallows it, so a full disk or a container made read-only could leave
+  the store saying the bytes were written. The client records what a write reported landing and
+  skips an identical write against that record, so the cost was not one lost queue but every repair
+  of it declined until the bytes changed. The write is flushed and synced where an `IOException`
+  still reaches the caller.
+- The 500-event queue cap holds on the launch after a crash. The file holds what is OWED, which is
+  the queue plus the non-ping half of the slice that was on the wire, so it can carry a whole
+  request more than the cap. It was restored whole and the queue started that launch at up to 600,
+  and stayed there until something else was tracked. It is trimmed on the way in, oldest first,
+  the same end the cap drops from everywhere else. The Swift SDK trims on the same path.
 - The documented `Retry-After` rule matches what the SDK does. 1.2.0 widened the header to any
   answered status, but its own note and the README both described the narrower `429`-only rule
   that the SDK had up to 1.1.0, and the Swift changelog repeated it. The code was right and three
