@@ -32,10 +32,24 @@ internal class HttpTransport(
 
     override fun lastAcceptedCount(): Int? = acceptedCount
 
+    /** See [Transport.lastThrottledCount]; refreshed on every 2xx, cleared otherwise. */
+    @Volatile
+    private var throttledCount: Int? = null
+
+    override fun lastThrottledCount(): Int? = throttledCount
+
+    /** See [Transport.lastOverQuotaDroppedCount]; refreshed on every 2xx, cleared otherwise. */
+    @Volatile
+    private var overQuotaDroppedCount: Int? = null
+
+    override fun lastOverQuotaDroppedCount(): Int? = overQuotaDroppedCount
+
     override fun send(body: ByteArray): Int {
         retryAfterSeconds = null
         heartbeatIntervalSeconds = null
         acceptedCount = null
+        throttledCount = null
+        overQuotaDroppedCount = null
         val connection = try {
             URL(endpoint).openConnection() as HttpURLConnection
         } catch (_: Exception) {
@@ -76,6 +90,8 @@ internal class HttpTransport(
                     if (status in 200..299) {
                         heartbeatIntervalSeconds = heartbeatIntervalIn(text)
                         acceptedCount = acceptedIn(text)
+                        throttledCount = throttledIn(text)
+                        overQuotaDroppedCount = overQuotaDroppedIn(text)
                     }
                 }
             } catch (_: IOException) {
@@ -96,6 +112,8 @@ internal class HttpTransport(
     internal companion object {
         private val HEARTBEAT_INTERVAL = Regex(""""heartbeat_interval"\s*:\s*"?(\d+)""")
         private val ACCEPTED = Regex(""""accepted"\s*:\s*"?(\d+)""")
+        private val THROTTLED = Regex(""""throttled"\s*:\s*"?(\d+)""")
+        private val OVER_QUOTA_DROPPED = Regex(""""over_quota_dropped"\s*:\s*"?(\d+)""")
 
         /** `heartbeat_interval` from an ingest response body, if it carries one. */
         internal fun heartbeatIntervalIn(body: String): Long? =
@@ -103,5 +121,12 @@ internal class HttpTransport(
 
         /** `accepted` from an ingest response body, if it carries one. */
         internal fun acceptedIn(body: String): Int? = ACCEPTED.find(body)?.groupValues?.get(1)?.toIntOrNull()
+
+        /** `throttled` from an ingest response body, if it carries one. */
+        internal fun throttledIn(body: String): Int? = THROTTLED.find(body)?.groupValues?.get(1)?.toIntOrNull()
+
+        /** `over_quota_dropped` from an ingest response body, if it carries one. */
+        internal fun overQuotaDroppedIn(body: String): Int? =
+            OVER_QUOTA_DROPPED.find(body)?.groupValues?.get(1)?.toIntOrNull()
     }
 }

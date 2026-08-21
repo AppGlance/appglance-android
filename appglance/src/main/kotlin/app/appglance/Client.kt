@@ -718,6 +718,32 @@ internal class Client(
     private fun isSaneHeartbeatFloorMillis(millis: Long): Boolean = millis in 15_000L..3_600_000L
 
     /**
+     * A 2xx can also carry two counts of well-formed rows the server deliberately did not keep,
+     * and each names a problem only the developer can fix, so debug mode says them out loud.
+     * `throttled` is the per-install rate limiter: this one install sent faster than any real
+     * usage does, which in practice is an event call in a loop. `over_quota_dropped` is the plan
+     * gate: the account is past its cap and its grace, and billable events are not being stored.
+     * Neither is re-sent, by the server's design: re-sending would feed the loop in the first
+     * case and cannot succeed in the second, and none of it counts against the plan.
+     */
+    private fun logServerDrops() {
+        val throttled = transport.lastThrottledCount()
+        if (throttled != null && throttled > 0) {
+            log {
+                "⚠ the server rate limited $throttled event${if (throttled == 1) "" else "s"} from this" +
+                    " install - faster than any real usage sends; look for a track() call in a loop"
+            }
+        }
+        val dropped = transport.lastOverQuotaDroppedCount()
+        if (dropped != null && dropped > 0) {
+            log {
+                "⚠ $dropped event${if (dropped == 1) "" else "s"} not stored: the account is past its plan's" +
+                    " cap and grace; upgrade in the dashboard, or recording resumes when the month resets"
+            }
+        }
+    }
+
+    /**
      * A persisted stamp, or null when the number on disk cannot be one: not after the epoch, or
      * ahead of [t]. The presence stamps are this install's only record of when it was last heard
      * from, and a device whose clock was hours ahead when they were written leaves every one of
@@ -849,6 +875,7 @@ internal class Client(
                     // After the slice has left [inFlightBatch], so "still owed" means what it says.
                     noteDeliveredTraits(batch, transport.lastAcceptedCount())
                     adoptHeartbeatFloor(transport.lastHeartbeatIntervalSeconds())
+                    logServerDrops()
                 }
 
                 status == 413 && batch.size > 1 -> {

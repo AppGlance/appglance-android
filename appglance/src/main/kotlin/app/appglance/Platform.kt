@@ -130,6 +130,23 @@ internal interface Transport {
      */
     fun lastAcceptedCount(): Int? = null
 
+    /**
+     * The `throttled` count carried by the most recent 2xx response body: well-formed rows the
+     * ingest's per-install rate limiter dropped before storage, because one install sent faster
+     * than any real usage does. Null when the answer said nothing about it. The rows are not
+     * re-sent (that would feed the loop that caused them) and never count against the plan; the
+     * client's only use for the number is to say it out loud in debug mode.
+     */
+    fun lastThrottledCount(): Int? = null
+
+    /**
+     * The `over_quota_dropped` count carried by the most recent 2xx response body: well-formed
+     * rows the plan gate stopped storing, because the account is past its cap and its grace.
+     * Null when the answer said nothing about it. A re-send cannot succeed until the month rolls
+     * or the plan changes, so the client only says it out loud in debug mode.
+     */
+    fun lastOverQuotaDroppedCount(): Int? = null
+
     companion object {
         /**
          * The request failed after a connection existed - a timeout, or a connection dropped

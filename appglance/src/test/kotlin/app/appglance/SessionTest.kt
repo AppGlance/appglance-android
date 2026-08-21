@@ -431,6 +431,53 @@ class SessionTest {
         assertEquals(60_000L, second.heartbeatIntervalMillis())
     }
 
+    /**
+     * The server's two deliberate-drop counts reach logcat in debug mode. The response is read by
+     * the very loop that is broken, so these lines are how a track() call in a loop, or a plan out
+     * of allowance, is noticed from the IDE rather than days later from a quota email.
+     */
+    @Test
+    fun `a throttled or over-quota answer is said out loud in debug`() {
+        val lines = mutableListOf<String>()
+        val previous = Log.sink
+        Log.sink = { lines += it }
+        try {
+            val rig = Rig()
+            val client = makeClient(
+                rig.platform,
+                rig.clock,
+                rig.scheduler,
+                rig.transport,
+                config = testConfiguration(debug = true),
+            )
+            rig.transport.throttledCount = 90
+            rig.transport.overQuotaDroppedCount = 3
+            client.track("a", null)
+            client.flush()
+            assertTrue(
+                "the throttle count is said with its likely cause: $lines",
+                lines.any { it.contains("rate limited 90 events from this install") },
+            )
+            assertTrue(
+                "the over-quota count is said with the way out: $lines",
+                lines.any { it.contains("3 events not stored") && it.contains("cap") },
+            )
+
+            // A clean answer stays quiet: the lines exist for the two problems, not for every send.
+            lines.clear()
+            rig.transport.throttledCount = null
+            rig.transport.overQuotaDroppedCount = null
+            client.track("b", null)
+            client.flush()
+            assertTrue(
+                "nothing was dropped, so nothing is warned about: $lines",
+                lines.none { it.contains("rate limited") || it.contains("not stored") },
+            )
+        } finally {
+            Log.sink = previous
+        }
+    }
+
     @Test
     fun `a brief interruption resumes the same session`() {
         val rig = Rig()

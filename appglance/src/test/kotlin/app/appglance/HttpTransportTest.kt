@@ -115,6 +115,11 @@ class HttpTransportTest {
         assertEquals(3, HttpTransport.acceptedIn("""{"accepted":3,"heartbeat_interval":240}"""))
         assertEquals(0, HttpTransport.acceptedIn("""{"accepted": 0, "rejected": 2}"""))
         assertEquals(null, HttpTransport.acceptedIn("{}"))
+        // The two deliberate-drop counts ride the same body the same way.
+        assertEquals(90, HttpTransport.throttledIn("""{"accepted":10,"throttled":90}"""))
+        assertEquals(null, HttpTransport.throttledIn("""{"accepted":10}"""))
+        assertEquals(3, HttpTransport.overQuotaDroppedIn("""{"accepted":0,"over_quota_dropped":3}"""))
+        assertEquals(null, HttpTransport.overQuotaDroppedIn("{}"))
 
         val transport = HttpTransport(endpoint, "k")
         respondWith = 202

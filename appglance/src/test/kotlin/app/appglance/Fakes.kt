@@ -115,6 +115,18 @@ internal class RecordingTransport : Transport {
 
     override fun lastAcceptedCount(): Int? = acceptedCount
 
+    /** When set, reported as the `throttled` count of every 2xx response body - the ingest's
+     *  per-install rate limiter saying it dropped rows from an install sending too fast. */
+    @Volatile var throttledCount: Int? = null
+
+    override fun lastThrottledCount(): Int? = throttledCount
+
+    /** When set, reported as the `over_quota_dropped` count of every 2xx response body - the plan
+     *  gate saying the account is past its cap and its grace. */
+    @Volatile var overQuotaDroppedCount: Int? = null
+
+    override fun lastOverQuotaDroppedCount(): Int? = overQuotaDroppedCount
+
     fun script(vararg s: Int) = synchronized(lock) {
         statuses.clear()
         statuses.addAll(s.toList())
