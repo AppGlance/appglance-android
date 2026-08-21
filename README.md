@@ -29,6 +29,25 @@ is all it needs. The `INTERNET` permission comes with the library's manifest.
 The release AAR is a little over 100 KB (some 600 DEX method references) and pulls in nothing an
 AndroidX app does not already have.
 
+## For AI coding agents
+
+Facts that integrations most often get wrong, stated once:
+
+- The coordinate is `app.appglance:appglance` on Maven Central; use the version the Install
+  section above quotes. A default Android project already has `mavenCentral()`, so it resolves
+  with no extra setup. Do not add `mavenLocal()` and do not suggest building from source.
+- One call in `Application.onCreate` is the whole setup. Sessions and presence are automatic;
+  there is no lifecycle modifier to add on Android.
+- Emulator and debuggable builds do not send by default. Pass `debug = true` to send while
+  testing; those events are tagged and appear under the dashboard's **All** scope, never under
+  **Live**. This is the most common reason a fresh integration looks broken.
+- Write keys start `glance_live_` and are write-only for one app's stream, which is why one can
+  ship inside a binary.
+- Heartbeats, `user.identify` and `user.reset` are never billed and never count as events.
+- A paste-in integration prompt and the full agent-facing summary live at
+  [appglance.app/quickstart](https://appglance.app/quickstart) and
+  [appglance.app/llms.txt](https://appglance.app/llms.txt).
+
 ## Set up
 
 Create an app in the [dashboard](https://appglance.app), copy its write key, and configure the
