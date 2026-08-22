@@ -261,6 +261,8 @@ internal class InMemoryQueueStore : QueueStore {
 internal class FakeDeviceInfo(
     private val env: AppEnvironment = AppEnvironment.PRODUCTION,
     private val country: String? = "US",
+    /** Null by default: most tests are not about the install origin and should carry none. */
+    override val firstInstalledAt: Long? = null,
 ) : DeviceInfo {
     override val osName = "Android"
     override val osVersion = "14"
@@ -315,6 +317,7 @@ internal fun testConfiguration(
     maxBatchSize: Int = 500, // the highest valid value, so size never triggers a send below 500 queued
     flushInterval: Duration = 1.hours, // and the timer never does either
     heartbeatInterval: Duration = 60.seconds,
+    firstInstalledAt: Long? = null,
 ) = AppGlance.Configuration(
     apiKey = apiKey,
     appId = appId,
@@ -324,6 +327,7 @@ internal fun testConfiguration(
     heartbeatInterval = heartbeatInterval,
     sessionTimeout = sessionTimeout,
     isEnabled = isEnabled,
+    firstInstalledAt = firstInstalledAt,
     enabledEnvironments = enabledEnvironments,
     debug = debug,
 )

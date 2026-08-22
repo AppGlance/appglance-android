@@ -44,6 +44,10 @@ Facts that integrations most often get wrong, stated once:
 - Write keys start `glance_live_` and are write-only for one app's stream, which is why one can
   ship inside a binary.
 - Heartbeats, `user.identify` and `user.reset` are never billed and never count as events.
+- Adding AppGlance to an app that already has users does **not** report them all as new: the SDK
+  sends when the app first arrived (`PackageInfo.firstInstallTime`) and the dashboard counts them
+  as "already had it". Pass `firstInstalledAt` only if the app knows a date that reaches further
+  back than this device does.
 - A paste-in integration prompt and the full agent-facing summary live at
   [appglance.app/quickstart](https://appglance.app/quickstart) and
   [appglance.app/llms.txt](https://appglance.app/llms.txt).
@@ -163,6 +167,7 @@ AppGlance.configure(this, new AppGlance.Configuration.Builder("glance_live_…")
 | `enabledEnvironments` | `{PRODUCTION, BETA}` | Which environments send; emulator runs and debuggable builds never do by default. |
 | `environment` | `null` (auto) | Android cannot tell a Play testing track from production - pass `AppEnvironment.BETA` in that build (a flavor is the natural place). Emulator and debuggable are always detected. |
 | `trackAppLifecycle` | `true` | Automatic sessions via `ProcessLifecycleOwner`. Off → call `AppGlance.setActive(true/false)` yourself. |
+| `firstInstalledAt` | `null` (asks the package manager) | Epoch millis: when this person first got your app. Only worth setting if your app knows better; see below. |
 | `debug` | `false` | Sends from any environment (tag stays truthful) and logs to logcat. |
 | `endpoint` | hosted ingest | Point it at your own deployment of the ingest service. |
 | `appId`, `appVersion` | package name, `versionName` | Informational in hosted mode (the key identifies the app). |
@@ -170,6 +175,36 @@ AppGlance.configure(this, new AppGlance.Configuration.Builder("glance_live_…")
 Environments on the wire are the platform-neutral names `production` / `beta` / `emulator` /
 `debug`; the ingest stores them beside the Apple tiers, so a Play build is "Live" in the
 dashboard exactly like an App Store build.
+
+### Adding AppGlance to an app that already has users
+
+Every existing install mints its AppGlance id the first time your new build runs, so without
+help they would all read as new users on the day you ship: one enormous spike, with your real
+arrivals buried in it.
+
+They do not. The SDK reports when the app first arrived - `PackageInfo.firstInstallTime`, which
+rides the same lookup the SDK already does for your `versionName`. The dashboard counts those
+people as **already had it** rather than new, and your new-user numbers mean what they say from
+day one.
+
+Nothing to switch on. It needs no permission, no manifest entry, and adds nothing to your Data
+safety answers: it is a date about the app, not about the person, sent once per install
+alongside the `install` event.
+
+One thing worth knowing: the package manager's date is per device. It resets when someone
+uninstalls, and a new handset starts its own. If you keep your own signup or first-launch date,
+pass it and it wins:
+
+```kotlin
+AppGlance.configure(this, AppGlance.Configuration(
+    apiKey = "glance_live_…",
+    firstInstalledAt = account.createdAtMillis,
+))
+```
+
+Already shipped an older AppGlance and watched that spike happen? Upgrading fixes it. Every
+install that has not sent its date yet backfills on its next session, so the base corrects
+itself as people open the app.
 
 ## Guarantees
 

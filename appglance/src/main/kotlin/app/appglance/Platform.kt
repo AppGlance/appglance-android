@@ -74,6 +74,12 @@ internal interface DeviceInfo {
     val appVersion: String
     /** The app's package name - the default `appId`. */
     val defaultAppId: String
+    /**
+     * When this app was first installed on this device, in epoch milliseconds, or null when the
+     * package manager cannot say. Uninstalling resets it and a new handset starts its own, so it
+     * answers "new on this device"; see [InstallOrigin].
+     */
+    val firstInstalledAt: Long?
     /** The device's region setting as an ISO 3166-1 alpha-2 code, or null. Never GPS or IP. */
     fun country(): String?
     /** Where this build is running; `override` picks the channel when detection cannot. */

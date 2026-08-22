@@ -148,6 +148,17 @@ internal class Client(
     private val installPendingKey = "install.pending.$appId"
     private var installRecorded = false
 
+    /**
+     * What the device knew about this app before the SDK ran, and whether this install still owes
+     * it. Read as absent-means-owed: an install set up before this SDK version has nothing written
+     * here, which is exactly right - those installs were counted as new on the day their app
+     * adopted the SDK and are the ones with the most to correct, so the first carrier event after
+     * the upgrade backfills them. See [InstallOrigin].
+     */
+    private val originSentKey = "origin.sent.$appId"
+    private var origin: InstallOrigin? = null
+    private var originOwed = false
+
     init {
         // A minted id means this device is not the one the state below was written on. The install
         // id is device-bound (it is honoured only where the marker for the device that minted it
@@ -160,6 +171,14 @@ internal class Client(
         // install has nothing here to clear, so this costs it nothing.
         if (isNewInstall) forgetPersistedState()
         val bootTime = now()
+        // The app's own date outranks the package manager's: it survives the handset the package
+        // manager's answer is scoped to, and it knows about users who predate every device they
+        // now own. First plausible answer wins; see [InstallOrigin.isPlausible].
+        originOwed = !prefs.getBoolean(originSentKey)
+        origin = listOfNotNull(
+            config.firstInstalledAt?.let { InstallOrigin(it, InstallOrigin.Evidence.APP) },
+            device.firstInstalledAt?.let { InstallOrigin(it, InstallOrigin.Evidence.PACKAGE) },
+        ).firstOrNull { it.isPlausible(bootTime) }
         restoredStamp(prefs.getLong(lastActiveKey), bootTime)?.let {
             lastActiveAt = it
             sessionId = prefs.getString(sessionKey)
@@ -232,6 +251,7 @@ internal class Client(
             sessionKey,
             pendingSessionKey,
             installPendingKey,
+            originSentKey,
             traitsKey,
         )
         for (key in keys) prefs.remove(key)
@@ -331,6 +351,25 @@ internal class Client(
      */
     fun track(signal: String, metadata: Map<String, String>?, at: Long? = null) {
         if (!collecting || retired) return
+        // The origin rides the first of the SDK's own events recorded once something has answered
+        // for it: this install's `install`, or - for an install upgrading from a version that never
+        // sent one - whichever `session.start` comes first. Never `user.identify`, whose metadata IS
+        // the user's property set and is stored exactly as sent, and never `heartbeat`, which is not
+        // stored as an event at all.
+        //
+        // Marked sent the moment it is queued rather than when it is delivered, the same way
+        // `install` is: a death in between costs this install one label, where clearing it after
+        // delivery would put the same fact on a second carrier and give the server two answers to
+        // reconcile.
+        var fields = metadata
+        val owed = origin
+        if (originOwed && owed != null && InstallOrigin.carriedBy(signal)) {
+            // The app's own keys go on last and win: a value invented here must never overwrite one
+            // the app chose.
+            fields = LinkedHashMap(owed.metadata()).apply { putAll(metadata ?: emptyMap()) }
+            originOwed = false
+            prefs.putBoolean(originSentKey, true)
+        }
         val event = Event(
             eventId = UUID.randomUUID().toString(),
             sessionId = sessionId,
@@ -343,7 +382,7 @@ internal class Client(
             environment = environment.wireValue,
             country = if (config.collectsCountry) device.country() else null,
             clientTs = at ?: now(),
-            metadata = metadata?.let { LinkedHashMap(it) },
+            metadata = fields?.let { LinkedHashMap(it) },
         )
         val size = synchronized(queueLock) {
             queue.addLast(event)
@@ -362,7 +401,7 @@ internal class Client(
         }
         log {
             "▸ $signal" + (if (signal == Signal.HEARTBEAT) " (presence ping)" else "") +
-                (metadata?.let { " $it" } ?: "")
+                (fields?.let { " $it" } ?: "")
         }
         if (size >= config.maxBatchSize) flushSoon() else scheduleFlush()
     }

@@ -114,6 +114,30 @@ public object AppGlance {
          */
         public val trackAppLifecycle: Boolean = true,
         /**
+         * When this person first got your app, in epoch milliseconds, if you already know.
+         * Optional, and only worth setting if you are adding AppGlance to an app that already has
+         * users.
+         *
+         * Without it, every existing user mints an install id on the day your first AppGlance build
+         * ships, so all of them read as new users that day and your real arrivals are lost among
+         * them. The SDK asks the package manager by itself and usually gets an answer, so this is a
+         * refinement rather than a requirement. Set it when your app knows better than the package
+         * manager does, which it does whenever you keep your own signup or first-launch date, and
+         * whenever your users have moved between handsets:
+         *
+         * ```kotlin
+         * AppGlance.configure(context, AppGlance.Configuration(
+         *     apiKey = "glance_live_…",
+         *     firstInstalledAt = account.createdAtMillis,
+         * ))
+         * ```
+         *
+         * It is a date, never a name or an id, it is sent once per install, and it changes nothing
+         * about the events themselves: the dashboard uses it to sort a first sighting into "new" or
+         * "was already here" and for nothing else. A date in the future is ignored.
+         */
+        public val firstInstalledAt: Long? = null,
+        /**
          * Debug mode, for while you wire the SDK up. Default false. When on:
          *
          * - **This build sends**, whatever its environment. Events keep their real tag (`emulator` /
@@ -157,6 +181,7 @@ public object AppGlance {
             private var enabledEnvironments: Set<AppEnvironment> = defaults.enabledEnvironments
             private var environment: AppEnvironment? = defaults.environment
             private var trackAppLifecycle: Boolean = defaults.trackAppLifecycle
+            private var firstInstalledAt: Long? = defaults.firstInstalledAt
             private var debug: Boolean = defaults.debug
 
             public fun appId(value: String?): Builder = apply { appId = value }
@@ -183,6 +208,9 @@ public object AppGlance {
 
             public fun trackAppLifecycle(value: Boolean): Builder = apply { trackAppLifecycle = value }
 
+            /** Epoch milliseconds; see [Configuration.firstInstalledAt]. */
+            public fun firstInstalledAt(value: Long?): Builder = apply { firstInstalledAt = value }
+
             public fun debug(value: Boolean): Builder = apply { debug = value }
 
             public fun build(): Configuration = Configuration(
@@ -199,6 +227,7 @@ public object AppGlance {
                 enabledEnvironments = enabledEnvironments,
                 environment = environment,
                 trackAppLifecycle = trackAppLifecycle,
+                firstInstalledAt = firstInstalledAt,
                 debug = debug,
             )
         }

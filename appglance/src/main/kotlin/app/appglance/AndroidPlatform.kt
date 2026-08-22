@@ -223,6 +223,19 @@ internal class AndroidDeviceInfo(private val context: Context) : DeviceInfo {
     override val defaultAppId: String = context.packageName
 
     /**
+     * Off the same `PackageInfo` [appVersion] reads, so this costs one field rather than a lookup.
+     * Needs no permission and names no one: it is a date about the app, not about the person.
+     */
+    override val firstInstalledAt: Long? by lazy {
+        try {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(context.packageName, 0).firstInstallTime.takeIf { it > 0 }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
      * The device's region setting as an ISO country code (e.g. "US") - not GPS, no permission, no
      * IP. The system locale rather than the app's, so an in-app language switch does not move a
      * user on the map. Only real two-letter codes are sent (numeric regions mean nothing on a map).

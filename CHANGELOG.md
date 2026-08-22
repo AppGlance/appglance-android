@@ -6,6 +6,37 @@ All notable changes to the AppGlance Android SDK (`app.appglance:appglance`). Th
 [GitHub Release](https://github.com/AppGlance/appglance-android/releases) with the same notes.
 The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-apple/blob/main/CHANGELOG.md).
 
+## [Unreleased]
+
+### Added
+
+- **Existing users are no longer counted as new.** An app that adds AppGlance years after launch
+  has a user base the SDK has never seen, and every one of those installs used to read as a brand
+  new user on the day that build shipped: one enormous spike, with the real arrivals buried in it.
+  The SDK now reports when the app first arrived, so the dashboard can tell the two apart.
+
+  The answer is already in hand and costs nothing: `firstInstallTime` rides the same `PackageInfo`
+  the SDK already reads for your `versionName`. No new permission, no manifest entry, nothing
+  added to your Data safety answers - it is a date about the app, not about the person, and it is
+  sent once per install.
+
+  Nothing to do to get it. Upgrading is enough: an install that has never sent one backfills on
+  its next `session.start`, so an app already running an older AppGlance corrects its whole base
+  as people open it.
+
+- `Configuration.firstInstalledAt`, for when your app knows better than the package manager does.
+  The package manager's date is per device, so it resets when someone uninstalls and starts again
+  on a new handset. If you keep your own signup or first-launch date, pass it and it wins:
+
+  ```kotlin
+  AppGlance.configure(context, AppGlance.Configuration(
+      apiKey = "glance_live_…",
+      firstInstalledAt = account.createdAtMillis,
+  ))
+  ```
+
+  A date in the future is ignored.
+
 ## [1.2.3] - 2026-08-21
 
 ### Added
