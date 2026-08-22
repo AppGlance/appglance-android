@@ -114,6 +114,17 @@ public object AppGlance {
          */
         public val trackAppLifecycle: Boolean = true,
         /**
+         * Debug mode, for while you wire the SDK up. Default false. When on:
+         *
+         * - **This build sends**, whatever its environment. Events keep their real tag (`emulator` /
+         *   `debug`), so they appear under **All** in the dashboard and never in Live.
+         * - **The SDK logs** to logcat (tag `AppGlance`): environment and install id at configure,
+         *   each event as it is queued, each send and the server's answer.
+         *
+         * `isEnabled = false` still wins. Gate it on your own `BuildConfig.DEBUG`.
+         */
+        public val debug: Boolean = false,
+        /**
          * When this person first got your app, in epoch milliseconds, if you already know.
          * Optional, and only worth setting if you are adding AppGlance to an app that already has
          * users.
@@ -134,20 +145,10 @@ public object AppGlance {
          *
          * It is a date, never a name or an id, it is sent once per install, and it changes nothing
          * about the events themselves: the dashboard uses it to sort a first sighting into "new" or
-         * "was already here" and for nothing else. A date in the future is ignored.
+         * "was already here" and for nothing else. A date in the future, or one from
+         * before 2001, is ignored.
          */
         public val firstInstalledAt: Long? = null,
-        /**
-         * Debug mode, for while you wire the SDK up. Default false. When on:
-         *
-         * - **This build sends**, whatever its environment. Events keep their real tag (`emulator` /
-         *   `debug`), so they appear under **All** in the dashboard and never in Live.
-         * - **The SDK logs** to logcat (tag `AppGlance`): environment and install id at configure,
-         *   each event as it is queued, each send and the server's answer.
-         *
-         * `isEnabled = false` still wins. Gate it on your own `BuildConfig.DEBUG`.
-         */
-        public val debug: Boolean = false,
     ) {
         /**
          * Builds a [Configuration] from Java, where Kotlin's default arguments and
@@ -181,8 +182,8 @@ public object AppGlance {
             private var enabledEnvironments: Set<AppEnvironment> = defaults.enabledEnvironments
             private var environment: AppEnvironment? = defaults.environment
             private var trackAppLifecycle: Boolean = defaults.trackAppLifecycle
-            private var firstInstalledAt: Long? = defaults.firstInstalledAt
             private var debug: Boolean = defaults.debug
+            private var firstInstalledAt: Long? = defaults.firstInstalledAt
 
             public fun appId(value: String?): Builder = apply { appId = value }
 
@@ -208,10 +209,10 @@ public object AppGlance {
 
             public fun trackAppLifecycle(value: Boolean): Builder = apply { trackAppLifecycle = value }
 
+            public fun debug(value: Boolean): Builder = apply { debug = value }
+
             /** Epoch milliseconds; see [Configuration.firstInstalledAt]. */
             public fun firstInstalledAt(value: Long?): Builder = apply { firstInstalledAt = value }
-
-            public fun debug(value: Boolean): Builder = apply { debug = value }
 
             public fun build(): Configuration = Configuration(
                 apiKey = apiKey,
@@ -227,8 +228,8 @@ public object AppGlance {
                 enabledEnvironments = enabledEnvironments,
                 environment = environment,
                 trackAppLifecycle = trackAppLifecycle,
-                firstInstalledAt = firstInstalledAt,
                 debug = debug,
+                firstInstalledAt = firstInstalledAt,
             )
         }
 

@@ -167,8 +167,8 @@ AppGlance.configure(this, new AppGlance.Configuration.Builder("glance_live_…")
 | `enabledEnvironments` | `{PRODUCTION, BETA}` | Which environments send; emulator runs and debuggable builds never do by default. |
 | `environment` | `null` (auto) | Android cannot tell a Play testing track from production - pass `AppEnvironment.BETA` in that build (a flavor is the natural place). Emulator and debuggable are always detected. |
 | `trackAppLifecycle` | `true` | Automatic sessions via `ProcessLifecycleOwner`. Off → call `AppGlance.setActive(true/false)` yourself. |
-| `firstInstalledAt` | `null` (asks the package manager) | Epoch millis: when this person first got your app. Only worth setting if your app knows better; see below. |
 | `debug` | `false` | Sends from any environment (tag stays truthful) and logs to logcat. |
+| `firstInstalledAt` | `null` (asks the package manager) | Epoch millis: when this person first got your app. Only worth setting if your app knows better; see below. |
 | `endpoint` | hosted ingest | Point it at your own deployment of the ingest service. |
 | `appId`, `appVersion` | package name, `versionName` | Informational in hosted mode (the key identifies the app). |
 

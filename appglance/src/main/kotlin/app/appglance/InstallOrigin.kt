@@ -50,6 +50,10 @@ internal data class InstallOrigin(val firstInstalledAt: Long, val evidence: Evid
      * otherwise claim an install date after the moment it was read, which reads downstream as a
      * user who arrived tomorrow. Rejected rather than clamped: a nonsense date is not evidence, and
      * no evidence is a state the server already knows how to handle.
+     *
+     * The floor is the one the server applies. An install date cannot predate the platform, and a
+     * signup date passed by the app that does is still evidence, so the floor is there only to
+     * catch a clock that was never set and reads as 1970.
      */
     fun isPlausible(now: Long): Boolean =
         firstInstalledAt <= now + ONE_DAY_MILLIS && firstInstalledAt > EARLIEST_PLAUSIBLE_MILLIS
@@ -59,8 +63,8 @@ internal data class InstallOrigin(val firstInstalledAt: Long, val evidence: Evid
         const val KEY_EVIDENCE: String = "\$install_evidence"
 
         private const val ONE_DAY_MILLIS = 24L * 60 * 60 * 1000
-        /** 2008-09-23, the day the first Android handset shipped. Nothing installed before it. */
-        private const val EARLIEST_PLAUSIBLE_MILLIS = 1_222_128_000_000L
+        /** 2001-09-09, the same floor as the server's. */
+        private const val EARLIEST_PLAUSIBLE_MILLIS = 1_000_000_000_000L
 
         /** The signals the origin is allowed to ride; see [Client.track]. */
         fun carriedBy(signal: String): Boolean = signal == Signal.INSTALL || signal == Signal.SESSION_START

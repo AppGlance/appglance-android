@@ -153,6 +153,33 @@ class InstallOriginTest {
         }
     }
 
+    /**
+     * The floor catches a clock that was never set, not a date that merely predates the platform:
+     * a signup date an app passes from before Android existed is still evidence of a long-standing
+     * user, and the server applies the same floor.
+     */
+    @Test
+    fun `a signup date older than the platform is still evidence`() {
+        val clock = FakeClock()
+        val signup = 1_100_000_000_000L // 2004-11-09
+        val platform = InMemoryPlatform(device = FakeDeviceInfo(firstInstalledAt = clock.now - year))
+        val client = makeClient(
+            platform,
+            clock,
+            FakeScheduler(clock),
+            RecordingTransport(),
+            config = testConfiguration(firstInstalledAt = signup),
+            isNewInstall = true,
+        )
+
+        client.recordInstallIfNeeded()
+
+        val carried = origins(client.pendingEvents())
+        assertEquals(1, carried.size)
+        assertEquals("app", carried[0][InstallOrigin.KEY_EVIDENCE])
+        assertEquals(Iso8601.format(signup), carried[0][InstallOrigin.KEY_INSTALLED_AT])
+    }
+
     /** Nothing to say is not something to send. */
     @Test
     fun `a device that cannot answer sends no origin`() {

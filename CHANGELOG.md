@@ -35,7 +35,7 @@ The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-app
   ))
   ```
 
-  A date in the future is ignored.
+  A date in the future, or one from before 2001, is ignored.
 
 ## [1.2.3] - 2026-08-21
 
