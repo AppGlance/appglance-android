@@ -206,6 +206,10 @@ Already shipped an older AppGlance and watched that spike happen? Upgrading fixe
 install that has not sent its date yet backfills on its next session, so the base corrects
 itself as people open the app.
 
+The dashboard's alerts follow the same rule: a push alert wired to `install` stays quiet for
+people counted as already had it, and webhook payloads label every install `new`,
+`pre_existing` or `unknown`, so nothing announces your existing base as new users.
+
 ## Guarantees
 
 - Every public call is cheap and non-blocking. Calls apply strictly in call order on one
