@@ -209,7 +209,8 @@ itself as people open the app.
 The dashboard's alerts follow the same rule: an `install` alert to a channel a person reads
 (push, Discord or ntfy) stays quiet for people counted as already had it, and JSON webhook
 payloads label every install `new`, `pre_existing` or `unknown`, so nothing announces your
-existing base as new users.
+existing base as new users. An Alerts-tab switch announces them anyway if you prefer,
+captioned as already had it.
 
 ## Guarantees
 
