@@ -6,6 +6,17 @@ All notable changes to the AppGlance Android SDK (`app.appglance:appglance`). Th
 [GitHub Release](https://github.com/AppGlance/appglance-android/releases) with the same notes.
 The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-apple/blob/main/CHANGELOG.md).
 
+## [Unreleased]
+
+### Fixed
+
+- `install` is recorded when there is something to count: at the install's first foreground, or
+  ahead of its first event, whichever comes first. The first run of a build that adopts the SDK is
+  often a process the system starts in the background (a push, a scheduled job, a broadcast), and
+  recording `install` there made the install active on a day nobody opened the app. `install` is
+  still recorded exactly once and always first, in the session of the visit it arrives with, and an
+  install owed by a process that ends in the background is paid by the next one.
+
 ## [1.2.4] - 2026-08-22
 
 ### Added

@@ -136,7 +136,6 @@ class IdentityTest {
             config = testConfiguration(enabledEnvironments = emptySet()),
             userId = "install-1",
             isNewInstall = true,
-            installAt = clock.now,
         )
         gated.recordInstallIfNeeded()
         assertEquals("a gated client records nothing", emptyList<String>(), gated.pendingSignals())
@@ -145,7 +144,7 @@ class IdentityTest {
         // The next launch is the release build: the id is already stored, so `isNewInstall` is
         // false, and only the note left on disk can say that an install is still owed.
         val transport = RecordingTransport()
-        val sending = makeClient(platform, clock, scheduler, transport, userId = "install-1", installAt = clock.now)
+        val sending = makeClient(platform, clock, scheduler, transport, userId = "install-1")
         sending.recordInstallIfNeeded()
         assertEquals(
             "the install the gated launch could not record",

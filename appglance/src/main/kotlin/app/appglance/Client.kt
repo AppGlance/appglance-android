@@ -20,8 +20,6 @@ internal class Client(
     private val userId: String,
     /** True exactly once per install: the launch that minted the id. */
     private val isNewInstall: Boolean,
-    /** When `configure` ran; the `install` event is stamped with it. */
-    private val installAt: Long?,
     private val platform: Platform,
     private val scheduler: Scheduler,
     private val sendExecutor: Executor,
@@ -136,17 +134,18 @@ internal class Client(
     private val traitsKey = "traits.$appId"
 
     /**
-     * Set while this install still owes its `install` event, and cleared the moment the event is
-     * queued. The launch that mints the install id is not always one that can record: the
-     * environment gate excludes debuggable builds and emulators by default, and an app waiting for
-     * consent configures with `isEnabled = false`, so [track] is a no-op on both. [isNewInstall] is
-     * true on that one launch only, so without a note on disk the event is owed by a launch that is
-     * already over and is lost for the life of the install. Nothing written means nothing owed,
-     * which is how an install whose storage carries no marker reads: it was counted on the launch
-     * that minted its id.
+     * Set while this install still owes its `install` event: written by the launch that mints the
+     * install id, cleared the moment the event is queued. The event is due once there is something
+     * to count (see [recordInstallIfNeeded]), and the launch that mints the id often has nothing:
+     * the system starts the process in the background for a push, a scheduled job or a broadcast,
+     * and nobody sees those. Nor can every launch record: the environment gate excludes debuggable
+     * builds and emulators by default, and an app waiting for consent configures with
+     * `isEnabled = false`. So the debt is kept on disk and the first launch that has something to
+     * count pays it. Nothing written means nothing owed, which is how an install whose storage
+     * carries no marker reads: it was counted when it was new.
      */
     private val installPendingKey = "install.pending.$appId"
-    private var installRecorded = false
+    private var installOwed = false
 
     /**
      * What the device knew about this app before the SDK ran, and whether this install still owes
@@ -168,8 +167,14 @@ internal class Client(
         // own. The traits are the lasting half: `identify` only sends a change, so an install
         // whose cache says the server already has these properties never sends them, and its page
         // in the dashboard stays empty however often the app calls `identify`. A genuinely new
-        // install has nothing here to clear, so this costs it nothing.
-        if (isNewInstall) forgetPersistedState()
+        // install has nothing here to clear, so this costs it nothing. Only a launch that mints the
+        // id writes the install debt, so a debuggable build run over an installed release copy
+        // leaves nothing behind and no install is ever recorded twice.
+        if (isNewInstall) {
+            forgetPersistedState()
+            prefs.putBoolean(installPendingKey, true)
+        }
+        installOwed = prefs.getBoolean(installPendingKey)
         val bootTime = now()
         // The app's own date outranks the package manager's: it survives the handset the package
         // manager's answer is scoped to, and it knows about users who predate every device they
@@ -301,30 +306,22 @@ internal class Client(
     // region Commands (called by the facade)
 
     /**
-     * Records `install`, exactly once per install, ahead of everything else.
-     *
-     * A launch that mints the install id and cannot record writes the debt down instead, and the
-     * first launch that is collecting pays it, stamped with its own `configure`: the moment this
-     * install can first be counted, and the moment the rest of that first batch belongs to. An
-     * older stamp would date the install to a run the app asked to be left out of its numbers.
-     * Only a launch that mints the id ever writes the marker, so a debuggable build run over an
-     * installed release copy leaves nothing behind and no install is ever recorded twice.
+     * Records `install`, exactly once per install, ahead of everything else. It is due at the
+     * install's first foreground or ahead of its first event, whichever comes first: [setActive]
+     * and [track] call this before they record anything, so `install` is always the first event,
+     * carries the session the visit belongs to, and is stamped with the moment that made it due. A
+     * launch into the background that records nothing of its own sends nothing, and a launch that
+     * is not collecting records nothing at all; either way the debt stays on disk for the next
+     * launch.
      */
-    fun recordInstallIfNeeded() {
-        if (installRecorded || retired) return
-        val owed = prefs.getBoolean(installPendingKey)
-        if (!isNewInstall && !owed) return
-        if (!collecting) {
-            // The facade asks again on every command; write only what is not already there.
-            if (!owed) prefs.putBoolean(installPendingKey, true)
-            return
-        }
-        installRecorded = true
+    fun recordInstallIfNeeded(at: Long? = null) {
+        if (!installOwed || !collecting || retired) return
+        installOwed = false
         // Cleared before the event is queued, as the pre-minted session id's marker is: a death in
         // between costs this install its `install`, where clearing it afterwards would record a
         // second one on the next launch. One uncounted install beats one counted twice.
         prefs.remove(installPendingKey)
-        track(Signal.INSTALL, null, installAt)
+        track(Signal.INSTALL, null, at)
     }
 
     /**
@@ -351,6 +348,9 @@ internal class Client(
      */
     fun track(signal: String, metadata: Map<String, String>?, at: Long? = null) {
         if (!collecting || retired) return
+        val stamp = at ?: now()
+        // Whatever this install records first, `install` goes ahead of it, at the same moment.
+        if (signal != Signal.INSTALL) recordInstallIfNeeded(stamp)
         // The origin rides the first of the SDK's own events recorded once something has answered
         // for it: this install's `install`, or - for an install upgrading from a version that never
         // sent one - whichever `session.start` comes first. Never `user.identify`, whose metadata IS
@@ -381,7 +381,7 @@ internal class Client(
             osVersion = device.osVersion,
             environment = environment.wireValue,
             country = if (config.collectsCountry) device.country() else null,
-            clientTs = at ?: now(),
+            clientTs = stamp,
             metadata = fields?.let { LinkedHashMap(it) },
         )
         val size = synchronized(queueLock) {
@@ -499,6 +499,10 @@ internal class Client(
                     prefs.putString(sessionKey, minted)
                 }
                 track(Signal.SESSION_START, null, t)
+            } else {
+                // A visit that resumes a session still brings the app to the front, and the first
+                // time it does is when `install` is due. A new session gets it from [track].
+                recordInstallIfNeeded(t)
             }
             rememberActive(t)
             startHeartbeat()

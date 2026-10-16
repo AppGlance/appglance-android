@@ -87,7 +87,11 @@ class LifecycleSourceTest {
         AppGlance.configure(app, config())
         AppGlance.drain()
         val client = requireNotNull(AppGlance.currentClientForTesting())
-        assertEquals(listOf(Signal.INSTALL), client.pendingSignals())
+        assertEquals(
+            "nothing in front of the user yet, so nothing to count",
+            emptyList<String>(),
+            client.pendingSignals(),
+        )
         assertTrue(
             "and the SDK says which piece is missing, rather than reporting nothing in silence",
             lines.any { it.startsWith("androidx.startup's InitializationProvider isn't in this app's manifest") },

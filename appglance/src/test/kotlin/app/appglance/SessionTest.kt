@@ -37,7 +37,6 @@ class SessionTest {
             transport,
             config,
             isNewInstall = isNewInstall,
-            installAt = if (isNewInstall) clock.now else null,
             executor = executor,
         )
 

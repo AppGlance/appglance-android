@@ -500,15 +500,14 @@ public object AppGlance {
         client = null
         pending = cmd
         val started = startPendingIfPossible() ?: return   // id unreadable: hold commands until it isn't
-        started.recordInstallIfNeeded()                    // `install` goes first, always
         reported?.let { started.setActive(it, cmd.at) }
         replayWaiting(started)
     }
 
     /**
      * Builds the client from the pending configuration if the install id can be read now. `isNew`
-     * is true exactly once per install, and the client stamps `install` with the earliest moment
-     * this SDK holds for that install.
+     * is true exactly once per install: the launch that minted the id, which leaves the client
+     * owing `install` until there is something to count.
      */
     private fun startPendingIfPossible(): Client? {
         client?.let { return it }
@@ -516,17 +515,10 @@ public object AppGlance {
         val platform = platformFactory(cmd.context)
         val identity = AnonymousIdentity.current(platform.identity) ?: return null   // Direct Boot, before unlock
         pending = null
-        // `install` is queued first and stamped earliest. A call an app makes from a
-        // ContentProvider or a library initializer runs before `Application.onCreate` reaches
-        // `configure`, and such a call is held and replayed carrying the moment it was really
-        // made: the platform's first-seen rollup takes the smallest timestamp an install ever
-        // sends, so stamping `install` with `configure` would date the install after an event
-        // that provably preceded it.
         return Client(
             config = cmd.configuration,
             userId = identity.id,
             isNewInstall = identity.isNew,
-            installAt = minOf(cmd.at, earliestWaiting() ?: cmd.at),
             platform = platform,
             scheduler = scheduler,
             sendExecutor = sender,
@@ -534,18 +526,6 @@ public object AppGlance {
             now = now,
         ).also { client = it }
     }
-
-    /** The moment of the oldest call still waiting to be replayed, if any. */
-    private fun earliestWaiting(): Long? = waiting.mapNotNull { cmd ->
-        when (cmd) {
-            is Command.Configure -> cmd.at
-            is Command.Track -> cmd.at
-            is Command.Identify -> cmd.at
-            is Command.Reset -> cmd.at
-            is Command.SetActive -> cmd.at
-            Command.Flush -> null       // never buffered, and it carries no moment of its own
-        }
-    }.minOrNull()
 
     private fun dispatch(cmd: Command) {
         val c = startPendingIfPossible()
@@ -556,7 +536,6 @@ public object AppGlance {
             }
             return
         }
-        c.recordInstallIfNeeded()
         replayWaiting(c)
         apply(cmd, c)
     }

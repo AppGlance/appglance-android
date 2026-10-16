@@ -133,8 +133,8 @@ class ReconfigureTest {
         AppGlance.drain()
         val client = requireNotNull(AppGlance.currentClientForTesting())
         assertEquals(
-            "backgrounded: install only, no session, no heartbeat",
-            listOf(Signal.INSTALL),
+            "backgrounded: no install, no session, no heartbeat",
+            emptyList<String>(),
             client.pendingSignals(),
         )
 
@@ -142,6 +142,7 @@ class ReconfigureTest {
         AppGlance.drain()
         AppGlance.drain()
         assertEquals(
+            "the visit brings the install with it",
             listOf(Signal.INSTALL, Signal.SESSION_START),
             client.pendingSignals(),
         )
