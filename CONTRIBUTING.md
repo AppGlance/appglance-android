@@ -27,7 +27,7 @@ agree on the shape.
 
    ```bash
    ./gradlew :appglance:assembleRelease
-   ls -l appglance/build/outputs/aar/appglance-release.aar        # 1.0.0: 83 KB, 1.2.1: 107 KB, 1.2.4: 114 KB
+   ls -l appglance/build/outputs/aar/appglance-release.aar        # 1.0.0: 83 KB, 1.2.1: 107 KB, 1.2.4: 114 KB, 1.2.5: 113 KB
    ./gradlew :appglance:dependencies --configuration releaseRuntimeClasspath   # still only lifecycle-process?
    ```
 
