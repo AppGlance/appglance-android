@@ -205,6 +205,15 @@ private fun shortHash(value: String): String =
 
 /** Minimal, non-identifying device context. */
 internal class AndroidDeviceInfo(private val context: Context) : DeviceInfo {
+    /**
+     * Always "Android", on a tablet too. The Swift SDK reports `iPadOS` on an iPad because that is
+     * the name of the system the iPad runs; an Android tablet runs Android, so there is no
+     * counterpart to send. Phone against tablet is a device class, not an operating system, and
+     * folding it into `os_name` would split the dashboard's OS list by screen size; it needs a
+     * field of its own on the wire and in the database. Nor is an Android app on ChromeOS the twin
+     * of an iOS app on a Mac: its [osVersion] is the Android version inside ChromeOS, so naming the
+     * host system would pair it with a number that is not that system's.
+     */
     override val osName: String = "Android"
 
     /** `Build.VERSION.RELEASE` (`14`, `16`); the dashboard groups by `os_name` and the major version. */
