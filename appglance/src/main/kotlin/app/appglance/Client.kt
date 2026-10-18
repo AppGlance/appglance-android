@@ -17,7 +17,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 internal class Client(
     private val config: AppGlance.Configuration,
-    private val userId: String,
+    /**
+     * The install id every event this client records carries. Not private: [AppGlance.installId]
+     * hands it to the app, so a support screen shows the id the events were really sent under.
+     */
+    val userId: String,
     /** True exactly once per install: the launch that minted the id. */
     private val isNewInstall: Boolean,
     private val platform: Platform,

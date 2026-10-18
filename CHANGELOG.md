@@ -6,6 +6,26 @@ All notable changes to the AppGlance Android SDK (`app.appglance:appglance`). Th
 [GitHub Release](https://github.com/AppGlance/appglance-android/releases) with the same notes.
 The Swift SDK has [its own changelog](https://github.com/AppGlance/appglance-apple/blob/main/CHANGELOG.md).
 
+## [Unreleased]
+
+### Added
+
+- `AppGlance.installId` (`AppGlance.getInstallId()` from Java), the id this install's events
+  carry, for your support screen. Someone who writes in reads it out, you paste it (or its first
+  few characters) into the search on the dashboard's Users tab, and you are on their install
+  instead of guessing which row is theirs:
+
+  ```kotlin
+  binding.installId.text = AppGlance.installId ?: getString(R.string.not_available)
+  ```
+
+  It is read from the SDK's own client, so it is exactly the id the events were sent under, even on
+  a run whose save did not land. Reading it never blocks: it returns what the SDK's thread has
+  applied, which includes `configure` a moment after the call. A random UUID with nothing personal
+  in it, one per device; a reinstall on the same account usually keeps it, through Auto Backup.
+  null until `configure` has been applied, under Direct Boot before the first unlock, and in a
+  process other than the app's main one; `reset()` leaves it unchanged.
+
 ## [1.2.5] - 2026-10-16
 
 ### Fixed

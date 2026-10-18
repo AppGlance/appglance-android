@@ -232,6 +232,111 @@ class AppGlanceFacadeTest {
         }
     }
 
+    // region The public install id
+
+    /**
+     * Nothing is configured, so there is no install id to show yet - and reading must not invent
+     * one: a read that minted an id would be a second install the moment `configure` minted its own.
+     */
+    @Test
+    fun `the install id is null before configure`() {
+        AppGlance.track("early")                          // held, not applied
+        AppGlance.drain()
+        assertNull(AppGlance.installId)
+        assertNull("and reading started nothing", AppGlance.currentClientForTesting())
+    }
+
+    /** The id a support screen shows is the one on the events, for the launch that mints it too. */
+    @Test
+    fun `the install id is the id the events carry`() {
+        AppGlance.configure(app, config())                // a fresh install on this "device"
+        AppGlance.track("after")
+        AppGlance.drain()
+
+        val installId = assertNotNull(AppGlance.installId)
+        val events = assertNotNull(AppGlance.currentClientForTesting()).pendingEvents()
+        assertEquals(listOf(Signal.INSTALL, "after"), events.map { it.signal })
+        assertEquals("every event carries the id the app was given", setOf(installId), events.map { it.userId }.toSet())
+
+        // A relaunch reads the stored id back, and shows the same one.
+        AppGlance.resetForTesting()
+        AppGlance.transportFactory = { transport }
+        AppGlance.configure(app, config())
+        AppGlance.drain()
+        assertEquals(installId, AppGlance.installId)
+    }
+
+    /**
+     * A save that did not land leaves this run an id of its own, which the next launch will not
+     * find. The events this run sends still carry it, so that is the id a support screen must show:
+     * nothing was stored, and any other id would point at nobody.
+     */
+    @Test
+    fun `the install id is the run-only id when the save did not land`() {
+        val store = InMemoryIdentityStore(dropsWrites = true)
+        AppGlance.platformFactory = { InMemoryPlatform(identity = store) }
+        AppGlance.configure(app, config())
+        AppGlance.track("after")
+        AppGlance.drain()
+
+        val installId = assertNotNull(AppGlance.installId)
+        val events = assertNotNull(AppGlance.currentClientForTesting()).pendingEvents()
+        assertEquals("no install is claimed by an id nothing kept", listOf("after"), events.map { it.signal })
+        assertEquals(installId, events.single().userId)
+        assertNull("the id exists for this run only", store.value)
+    }
+
+    /**
+     * In Direct Boot, before the user's first unlock, the id cannot be read, so `configure` is
+     * pending and calls are held. There is no id to show until it can be read; once it can, the id
+     * is the real one.
+     */
+    @Test
+    fun `the install id is null while the id is unreadable`() {
+        AppGlance.platformFactory = { InMemoryPlatform(identity = InMemoryIdentityStore("REAL", locked = true)) }
+        AppGlance.configure(app, config())
+        AppGlance.track("held")
+        AppGlance.drain()
+        assertNull("no client yet, and a guess would be an id no event carries", AppGlance.installId)
+
+        AppGlance.platformFactory = { InMemoryPlatform(identity = InMemoryIdentityStore("REAL")) }
+        AppGlance.configure(app, config())
+        AppGlance.drain()
+        assertEquals("REAL", AppGlance.installId)
+        assertEquals(listOf("held"), assertNotNull(AppGlance.currentClientForTesting()).pendingSignals())
+    }
+
+    /**
+     * Sign-out forgets the labels, not the install: the id a person read off the support screen
+     * before signing out still finds their install afterwards.
+     */
+    @Test
+    fun `reset leaves the install id unchanged`() {
+        AppGlance.configure(app, config())
+        AppGlance.identify(id = "account-1", email = "ada@example.com")
+        AppGlance.drain()
+        val before = assertNotNull(AppGlance.installId)
+
+        AppGlance.reset()
+        AppGlance.track("after.reset")
+        AppGlance.drain()
+        assertEquals(before, AppGlance.installId)
+        val events = assertNotNull(AppGlance.currentClientForTesting()).pendingEvents()
+        assertEquals("after.reset", events.last().signal)
+        assertEquals("and the events after sign-out carry it too", setOf(before), events.map { it.userId }.toSet())
+    }
+
+    /** A secondary process collects nothing, so it has no install id to show either. */
+    @Test
+    fun `the install id is null outside the main process`() {
+        AppGlance.processName = { "${app.packageName}:sync" }
+        AppGlance.configure(app, config())
+        AppGlance.drain()
+        assertNull(AppGlance.installId)
+    }
+
+    // endregion
+
     @Test
     fun `configure with the plain key overload and debug mode narrates to logcat`() {
         AppGlance.configure(app, "glance_live_test", debug = true)

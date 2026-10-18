@@ -135,6 +135,22 @@ The install id stays the analytics identity; these are labels merged onto it. Ca
 characters, values up to 200; an empty string removes a key. Passing an email or a name changes
 your Play Data safety answers - see below.
 
+## Support screens
+
+```kotlin
+binding.installId.text = AppGlance.installId ?: getString(R.string.not_available)
+```
+
+`AppGlance.installId` (`AppGlance.getInstallId()` from Java) is the id this install's events
+carry. Show it on your support screen and someone who writes in can read it out: paste it, or its
+first few characters, into the search on the dashboard's Users tab to land on their install. It is
+a random UUID with nothing personal in it, so it is safe to show. It belongs to the device, not
+the person: Auto Backup carries it, so a reinstall on the same account usually keeps it, and no two
+devices share one, a backup restored onto a new handset included. It is null until `configure` has
+been applied, in a process other than the app's main one, and under Direct Boot before the user's
+first unlock; `reset()` leaves it as it is. Reading it never blocks, so it is safe on the main
+thread.
+
 ## Configuration
 
 ```kotlin

@@ -46,6 +46,16 @@ public class JavaApiTest {
         assertTrue(minimal.isEnabled());
     }
 
+    /**
+     * Compiled, never run: the facade starts its command thread on first use, which needs the
+     * Android runtime a plain JVM test does not have. Compiling is the point - the support-screen
+     * id has to stay a static getter a Java app can call. AppGlanceFacadeTest covers what it returns.
+     */
+    @SuppressWarnings("unused")
+    private static String installIdFromJava() {
+        return AppGlance.getInstallId();
+    }
+
     @Test
     public void theReservedNamesAreConstants() {
         assertEquals("heartbeat", Signal.HEARTBEAT);

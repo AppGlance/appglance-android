@@ -313,6 +313,12 @@ public object AppGlance {
     internal var processName: () -> String? = { currentProcessName() }
 
     // state (command thread only)
+    /**
+     * Written on the command thread only, like everything here. Volatile for the one reader that
+     * is not on it, [installId], which reads the reference and the id it carries (a `val`) and
+     * calls nothing on the client.
+     */
+    @Volatile
     private var client: Client? = null
     /** `configure` ran but the install id could not be read yet; retried on the next command. */
     private var pending: Command.Configure? = null
@@ -484,6 +490,43 @@ public object AppGlance {
     public fun flush() {
         handler.post { dispatch(Command.Flush) }
     }
+
+    /**
+     * This install's id: the one every event it sends carries, and the one the dashboard's search
+     * finds it by (paste the id, or its first few characters). Show it on your support screen and
+     * a person who writes in can read it out, so you go straight to their install instead of
+     * guessing which row in the Users list is theirs.
+     *
+     * ```kotlin
+     * binding.installId.text = AppGlance.installId ?: getString(R.string.not_available)
+     * ```
+     *
+     * It is a random UUID minted on this device, with nothing personal in it, so it is safe to
+     * display. It is per device, not per person: Auto Backup carries it, so a reinstall on the same
+     * account usually keeps it, and a second handset - a backup or a transfer restored onto one
+     * included - mints an id of its own.
+     *
+     * Null until [configure] has been applied, which happens on the SDK's own thread a moment after
+     * the call, so read it from a screen rather than on the line after `configure`. Null too while
+     * the id cannot be read yet (a Direct Boot launch before the user's first unlock, when calls are
+     * being held), and always in a process other than the app's main one, where [configure] does not
+     * collect. [reset] leaves it unchanged: sign-out takes the labels off the install, not the
+     * install away. It is also there while the SDK is not sending ([Configuration.isEnabled] off, or
+     * a build the environment gate keeps quiet), because it is still this install's id; it only
+     * finds something in the dashboard once events have been sent under it.
+     *
+     * Cheap and non-blocking, so it is safe on the main thread. From Java: `AppGlance.getInstallId()`.
+     */
+    @JvmStatic
+    public val installId: String?
+        // A read of what the command thread last published, not a trip through the queue. A read
+        // that drained the queue would make the main thread wait behind every command ahead of it,
+        // and a `track` rewrites the queue file on that thread, so a support screen opened after a
+        // burst of events would stall on disk I/O for an answer that only changes at `configure`.
+        // The id is the live client's own, so it is exactly what its events carry, the run-only
+        // id `AnonymousIdentity` hands out when a save did not land included; no client means
+        // none to ask, whether `configure` never ran or is pending on an unreadable store.
+        get() = client?.userId
 
     // endregion
 
